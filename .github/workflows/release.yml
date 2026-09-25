@@ -1,7 +1,7 @@
 # Builds the three vmdesk artifacts and attaches them to a GitHub Release on every push to main.
 # `workflow_dispatch` on any branch builds the same artifacts without publishing a release.
 #
-#   server             aarch64-unknown-linux-gnu, cross-compiled with cargo-zigbuild (Ubuntu 24.04 glibc 2.39)
+#   server             aarch64-unknown-linux-gnu, built natively on ubuntu-24.04-arm (glibc 2.39)
 #   client-windows.zip x86_64-pc-windows-msvc, FFmpeg shared DLLs (BtbN n8.1 LGPL build) beside client.exe
 #   client             x86_64-unknown-linux-gnu, built inside debian:13 against its libavcodec/libavutil/libswscale
 name: release
@@ -24,27 +24,25 @@ env:
 jobs:
   server:
     name: server (aarch64 linux)
-    runs-on: ubuntu-24.04
+    # Native build on GitHub's arm64 runner (free for public repositories). For a cross build from
+    # x86_64 see the README (cargo-zigbuild).
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install cargo-zigbuild and zig
-        run: python -m pip install --upgrade cargo-zigbuild==0.23.4 ziglang==0.14.1
       - uses: Swatinem/rust-cache@v2
         with:
           key: server-aarch64
-      - name: Cross-compile server
-        run: cargo zigbuild --release --locked -p server --target aarch64-unknown-linux-gnu.2.39
+      - name: Test server and proto on aarch64
+        run: cargo test --release --locked -p proto -p server
+      - name: Build server
+        run: cargo build --release --locked -p server
       - name: Collect
         run: |
           mkdir -p dist
-          cp target/aarch64-unknown-linux-gnu/release/server dist/server
+          cp target/release/server dist/server
           file dist/server
+          ./dist/server --version
       - uses: actions/upload-artifact@v4
         with:
           name: server

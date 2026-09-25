@@ -208,7 +208,9 @@ Rust stable (see `rust-toolchain.toml`).
 
 * Tests and lints (any Linux host with `libavcodec-dev libavutil-dev libswscale-dev clang`):
   `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`
-* Server for the VM from an x86_64 machine: `pip install cargo-zigbuild ziglang` then
+* Server for the VM: CI builds it natively on GitHub's `ubuntu-24.04-arm` runner
+  (`cargo build --release -p server`). From an x86_64 machine cross-compile with
+  `pip install cargo-zigbuild ziglang` and
   `cargo zigbuild --release -p server --target aarch64-unknown-linux-gnu.2.39`
   (`target/aarch64-unknown-linux-gnu/release/server`).
 * Linux client: `cargo build --release -p client` on Debian 13 (or in a `debian:13` container,
