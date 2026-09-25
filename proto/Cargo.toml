@@ -1,6 +1,6 @@
 [package]
 name = "proto"
-description = "vmdesk shared wire protocol: control/mouse messages, key codes, signalling types and SDP helpers"
+description = "vmdesk shared wire protocol: control/mouse messages, key codes, signalling types, SDP helpers and logging setup"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+log = { workspace = true }
+tracing = { workspace = true }
+tracing-log = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

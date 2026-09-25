@@ -1,6 +1,5 @@
 //! `server doctor`: checks the VM and prints one PASS/FAIL/WARN line per item with the fix.
 
-use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -10,9 +9,9 @@ use anyhow::Result;
 
 use crate::capture;
 use crate::config::Config;
-use crate::convert::I420Frame;
+use crate::convert::{self, I420Frame, XrgbImage};
 use crate::encoder::{self, EncoderSettings};
-use crate::{netinfo, setup};
+use crate::{netinfo, setup, testpattern};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -79,7 +78,8 @@ pub fn run(config: &Config) -> Result<bool> {
     }
     checks.push(check_signalling_port(config));
     checks.push(check_service());
-    checks.push(check_encoder());
+    checks.push(check_convert());
+    checks.push(check_encoder(config));
 
     let mut failures = 0;
     for c in &checks {
@@ -455,16 +455,58 @@ fn check_service() -> Check {
     }
 }
 
-fn check_encoder() -> Check {
+/// Frames pushed through the encoder by the self-test (about a second of video).
+const ENCODER_TEST_FRAMES: usize = 30;
+
+/// Copy + convert speed for a 1080p frame: must stay far below the frame time.
+fn check_convert() -> Check {
+    let (w, h) = (1920usize, 1080usize);
+    let pitch = w * 4 + 256; // vkms pitches are not always tight
+    let src = testpattern::xrgb(w, h, pitch, 0);
+    let mut copy = XrgbImage::default();
+    let mut frame = I420Frame::new(0, 0);
+    // Warm up (page in, spawn the rayon pool), then time a few iterations.
+    convert::copy_xrgb(&src, w, h, pitch, &mut copy);
+    convert::xrgb_to_i420(&copy.data, w, h, copy.pitch(), &mut frame);
+    let iterations = 10;
+    let mut copy_total = Duration::ZERO;
+    let mut convert_total = Duration::ZERO;
+    for _ in 0..iterations {
+        let t = Instant::now();
+        convert::copy_xrgb(&src, w, h, pitch, &mut copy);
+        copy_total += t.elapsed();
+        let t = Instant::now();
+        convert::xrgb_to_i420(&copy.data, w, h, copy.pitch(), &mut frame);
+        convert_total += t.elapsed();
+    }
+    let copy_ms = copy_total.as_secs_f64() * 1000.0 / iterations as f64;
+    let convert_ms = convert_total.as_secs_f64() * 1000.0 / iterations as f64;
+    let detail = format!(
+        "1080p copy {copy_ms:.1} ms + XRGB->I420 {convert_ms:.1} ms ({} kernel, {} threads)",
+        convert::kernel_name(),
+        rayon::current_num_threads()
+    );
+    if copy_ms + convert_ms < 12.0 {
+        pass("frame conversion", detail)
+    } else {
+        warn(
+            "frame conversion",
+            detail,
+            "conversion is slow; check that the VM is not CPU starved (top) and report the numbers",
+        )
+    }
+}
+
+/// Encodes a second of moving 1080p video and reports the sustained frame rate.
+fn check_encoder(config: &Config) -> Check {
     let settings = EncoderSettings {
         width: 1920,
         height: 1080,
-        fps: 30,
-        bitrate_kbps: 12_000,
-        keyframe_interval: 600,
-        threads: 0,
+        fps: config.video.fps.max(1),
+        bitrate_kbps: config.video.bitrate_kbps,
+        keyframe_interval: config.video.keyframe_interval,
+        threads: config.video.encoder_threads,
     };
-    let t = Instant::now();
     let mut enc = match encoder::create(settings) {
         Ok(e) => e,
         Err(e) => {
@@ -475,19 +517,51 @@ fn check_encoder() -> Check {
             )
         }
     };
-    let frame = I420Frame::new(1920, 1080);
-    let mut detail = String::new();
-    match enc.encode(&frame, 0, true) {
-        Ok(Some(out)) => {
-            let _ = write!(
-                detail,
-                "OpenH264 1080p keyframe {} bytes in {:.0} ms",
-                out.data.len(),
-                t.elapsed().as_secs_f64() * 1000.0
-            );
-            pass("encoder", detail)
+    let frames: Vec<I420Frame> = (0..ENCODER_TEST_FRAMES)
+        .map(|i| testpattern::i420(1920, 1080, i))
+        .collect();
+    let mut idr_bytes = 0usize;
+    let mut total_bytes = 0usize;
+    let mut max_ms = 0.0f64;
+    let t = Instant::now();
+    for (i, frame) in frames.iter().enumerate() {
+        let t_frame = Instant::now();
+        match enc.encode(frame, (i as u64) * 1000 / u64::from(settings.fps), i == 0) {
+            Ok(Some(out)) => {
+                if i == 0 {
+                    if !out.keyframe {
+                        return fail("encoder", "first frame is not an IDR", "report this");
+                    }
+                    idr_bytes = out.data.len();
+                }
+                total_bytes += out.data.len();
+            }
+            Ok(None) => return fail("encoder", format!("frame {i} skipped"), "report this"),
+            Err(e) => return fail("encoder", format!("{e:#}"), "report this"),
         }
-        Ok(None) => fail("encoder", "no output for a forced keyframe", "report this"),
-        Err(e) => fail("encoder", format!("{e:#}"), "report this"),
+        max_ms = max_ms.max(t_frame.elapsed().as_secs_f64() * 1000.0);
+    }
+    let secs = t.elapsed().as_secs_f64().max(1e-6);
+    let fps = ENCODER_TEST_FRAMES as f64 / secs;
+    let detail = format!(
+        "OpenH264 1080p: {fps:.0} fps sustained ({:.1} ms/frame avg, {max_ms:.0} ms max), IDR {idr_bytes} bytes, {:.0} kbit/s at {} fps target",
+        secs * 1000.0 / ENCODER_TEST_FRAMES as f64,
+        total_bytes as f64 * 8.0 / 1000.0 / (ENCODER_TEST_FRAMES as f64 / f64::from(settings.fps)),
+        settings.fps
+    );
+    if fps >= f64::from(settings.fps) {
+        pass("encoder", detail)
+    } else if fps >= f64::from(settings.fps) * 0.66 {
+        warn(
+            "encoder",
+            detail,
+            "the encoder cannot keep up with video.fps; lower video.fps or set video.encoder_threads = 4",
+        )
+    } else {
+        fail(
+            "encoder",
+            detail,
+            "far below the configured video.fps: check CPU load (top), lower video.fps or the resolution",
+        )
     }
 }

@@ -19,6 +19,12 @@ pub struct Scaler {
 
 unsafe impl Send for Scaler {}
 
+impl Default for Scaler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Scaler {
     pub fn new() -> Self {
         Self {

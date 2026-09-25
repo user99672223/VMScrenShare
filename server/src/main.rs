@@ -1,20 +1,5 @@
 //! vmdesk server binary. See the README for the full setup flow.
 
-mod capture;
-mod config;
-mod convert;
-mod doctor;
-mod encoder;
-mod input;
-mod metadata;
-mod netinfo;
-mod pipeline;
-mod png_out;
-mod rtcp_forward;
-mod session;
-mod setup;
-mod signalling;
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,7 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::Config;
+use server::config::{self, Config};
+use server::signalling;
+use server::{capture, doctor, input, metadata, netinfo, pipeline, png_out, session, setup};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -189,15 +176,5 @@ fn capture_png(config: &Config, png: &std::path::Path, timeout_secs: u64) -> Res
 }
 
 fn init_logging(verbose: u8) {
-    let default = match verbose {
-        0 => "info,webrtc=warn,rtc=warn",
-        1 => "debug,webrtc=info,rtc=info",
-        _ => "trace",
-    };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    proto::logging::init(verbose, vec!["server", "proto"]);
 }

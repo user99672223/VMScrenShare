@@ -45,10 +45,92 @@ use crate::metadata;
 use crate::pipeline::Shared;
 use crate::rtcp_forward::{is_keyframe_request, KeyframeRequestForwarder};
 
-const MIME_TYPE_H264: &str = "video/H264";
-const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
-const H264_PAYLOAD_TYPE: u8 = 102;
+pub const MIME_TYPE_H264: &str = "video/H264";
+pub const H264_FMTP: &str =
+    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+pub const H264_PAYLOAD_TYPE: u8 = 102;
+/// SRTP/SRTCP replay window in packets (see `peer_connection_parts`).
+pub const REPLAY_WINDOW: usize = 1024;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Everything needed to build the server's peer connection the same way in `accept_offer`
+/// and in the end-to-end tests.
+pub struct PeerConnectionParts {
+    pub media_engine: MediaEngine,
+    pub registry: Registry,
+    pub setting_engine: rtc::peer_connection::configuration::setting_engine::SettingEngine,
+    pub udp_addrs: Vec<String>,
+}
+
+/// Media engine (H.264 only), default interceptors + the keyframe-request forwarder, ICE-lite
+/// setting engine and the UDP bind addresses for `port`.
+///
+/// `forward_all_rtcp` makes every inbound RTCP packet visible on the track (tests only).
+pub fn peer_connection_parts(
+    port: u16,
+    use_ipv6: bool,
+    forward_all_rtcp: bool,
+) -> Result<PeerConnectionParts> {
+    let mut media_engine = MediaEngine::default();
+    media_engine
+        .register_codec(h264_codec(), RtpCodecKind::Video)
+        .context("registering H264")?;
+    let forwarder = if forward_all_rtcp {
+        KeyframeRequestForwarder::all_rtcp()
+    } else {
+        KeyframeRequestForwarder::new()
+    };
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)
+        .context("default interceptors")?
+        .with(Slot::from(crate::rtcp_forward::SLOT), forwarder);
+    let mut network_types = vec![NetworkType::Udp4];
+    let mut udp_addrs = vec![format!("0.0.0.0:{port}")];
+    if use_ipv6 {
+        network_types.push(NetworkType::Udp6);
+        udp_addrs.push(format!("[::]:{port}"));
+    }
+    let setting_engine = SettingEngineBuilder::new()
+        .with_lite(true)
+        .with_network_types(network_types)
+        .with_multicast_dns_mode(MulticastDnsMode::Disabled)
+        // The default 64-packet replay windows are too small for a stream whose keyframes are
+        // 100+ packets: anything reordered or retransmitted across such a burst is rejected as
+        // a replay. The server only receives RTCP, but keep both windows generous.
+        .with_srtp_replay_protection_window(REPLAY_WINDOW)
+        .with_srtcp_replay_protection_window(REPLAY_WINDOW)
+        .build();
+    Ok(PeerConnectionParts {
+        media_engine,
+        registry,
+        setting_engine,
+        udp_addrs,
+    })
+}
+
+/// The video track the encoder output is written to (one SSRC, H.264).
+pub fn video_track(ssrc: u32) -> Result<Arc<TrackLocalStaticSample>> {
+    let codec = h264_codec();
+    Ok(Arc::new(
+        TrackLocalStaticSample::new(
+            Instant::now(),
+            MediaStreamTrack::new(
+                "vmdesk".to_string(),
+                "vmdesk-video".to_string(),
+                "vmdesk video".to_string(),
+                RtpCodecKind::Video,
+                vec![RTCRtpEncodingParameters {
+                    rtp_coding_parameters: RTCRtpCodingParameters {
+                        ssrc: Some(ssrc),
+                        ..Default::default()
+                    },
+                    codec: codec.rtp_codec,
+                    ..Default::default()
+                }],
+            ),
+        )
+        .context("creating video track")?,
+    ))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -93,14 +175,16 @@ pub struct SessionManager {
     current: tokio::sync::Mutex<Option<Arc<dyn PeerConnection>>>,
 }
 
-enum PcEvent {
+/// Peer connection events the session loop cares about.
+pub enum PcEvent {
     Connection(RTCPeerConnectionState),
     Gathering(RTCIceGatheringState),
     DataChannel(Arc<dyn DataChannel>),
 }
 
-struct Handler {
-    events: mpsc::UnboundedSender<PcEvent>,
+/// Forwards the driver callbacks into a channel.
+pub struct Handler {
+    pub events: mpsc::UnboundedSender<PcEvent>,
 }
 
 #[async_trait::async_trait]
@@ -216,62 +300,21 @@ impl SessionManager {
         let use_ipv6 = self.net.use_ipv6();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
 
-        let codec = h264_codec();
-        let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_codec(codec.clone(), RtpCodecKind::Video)
-            .context("registering H264")?;
-        let registry = register_default_interceptors(Registry::new(), &mut media_engine)
-            .context("default interceptors")?
-            .with(
-                Slot::from(crate::rtcp_forward::SLOT),
-                KeyframeRequestForwarder::new(),
-            );
-        let mut network_types = vec![NetworkType::Udp4];
-        let mut udp_addrs = vec![format!("0.0.0.0:{port}")];
-        if use_ipv6 {
-            network_types.push(NetworkType::Udp6);
-            udp_addrs.push(format!("[::]:{port}"));
-        }
-        let setting_engine = SettingEngineBuilder::new()
-            .with_lite(true)
-            .with_network_types(network_types)
-            .with_multicast_dns_mode(MulticastDnsMode::Disabled)
-            .build();
-
+        let parts = peer_connection_parts(port, use_ipv6, false)?;
         let pc = PeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
-            .with_media_engine(media_engine)
-            .with_setting_engine(setting_engine)
-            .with_interceptor_registry(registry)
+            .with_media_engine(parts.media_engine)
+            .with_setting_engine(parts.setting_engine)
+            .with_interceptor_registry(parts.registry)
             .with_handler(Arc::new(Handler { events: events_tx }))
-            .with_udp_addrs(udp_addrs)
+            .with_udp_addrs(parts.udp_addrs)
             .build()
             .await
             .with_context(|| format!("creating peer connection on UDP port {port}"))?;
         let pc: Arc<dyn PeerConnection> = Arc::new(pc);
 
         let ssrc = pseudo_random_ssrc(session_id);
-        let track = Arc::new(
-            TrackLocalStaticSample::new(
-                Instant::now(),
-                MediaStreamTrack::new(
-                    "vmdesk".to_string(),
-                    "vmdesk-video".to_string(),
-                    "vmdesk video".to_string(),
-                    RtpCodecKind::Video,
-                    vec![RTCRtpEncodingParameters {
-                        rtp_coding_parameters: RTCRtpCodingParameters {
-                            ssrc: Some(ssrc),
-                            ..Default::default()
-                        },
-                        codec: codec.rtp_codec.clone(),
-                        ..Default::default()
-                    }],
-                ),
-            )
-            .context("creating video track")?,
-        );
+        let track = video_track(ssrc)?;
         let sender = pc
             .add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
             .await
@@ -377,7 +420,9 @@ fn merge_events(
     rx
 }
 
-fn h264_codec() -> RTCRtpCodecParameters {
+/// The single negotiated video codec: H.264 constrained baseline signalling
+/// (`profile-level-id=42e01f`, packetization mode 1) with NACK, PLI and FIR feedback.
+pub fn h264_codec() -> RTCRtpCodecParameters {
     RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
             mime_type: MIME_TYPE_H264.to_owned(),
@@ -457,8 +502,16 @@ async fn run_session(
 
     // Encoded frames → RTP.
     let writer_track = Arc::clone(&track);
+    let writer_shared = Arc::clone(&shared);
     let writer = tokio::spawn(async move {
-        write_frames(writer_track, sender, frame_rx, frame_duration).await;
+        write_frames(
+            writer_track,
+            sender,
+            frame_rx,
+            frame_duration,
+            writer_shared,
+        )
+        .await;
     });
 
     // Keyframe requests (PLI/FIR) from the client.
@@ -553,11 +606,14 @@ async fn run_session(
     );
 }
 
-async fn write_frames(
+/// Packetises encoded access units onto the track. Public so the end-to-end test drives the
+/// exact same writer.
+pub async fn write_frames(
     track: Arc<TrackLocalStaticSample>,
     sender: Arc<dyn RtpSender>,
     mut frames: mpsc::Receiver<crate::encoder::EncodedFrame>,
     frame_duration: Duration,
+    shared: Arc<Shared>,
 ) {
     // The payload type is only known once negotiation is done, which is before the first frame
     // can arrive (frames only flow after the connection is up).
@@ -584,8 +640,8 @@ async fn write_frames(
             tracing::warn!("no negotiated payload type yet, dropping frame");
             continue;
         };
-        // Real time between frames (static content is not re-encoded every tick), bounded
-        // so a long pause does not produce a huge RTP timestamp jump.
+        // Real time between frames (bounded so a stall does not produce a huge RTP timestamp
+        // jump); the nominal frame duration for the first frame.
         let duration = match last_pts {
             Some(prev) if frame.pts_ms > prev => {
                 Duration::from_millis(frame.pts_ms - prev).min(Duration::from_secs(2))
@@ -593,17 +649,22 @@ async fn write_frames(
             _ => frame_duration,
         };
         last_pts = Some(frame.pts_ms);
+        let keyframe = frame.keyframe;
         let sample = Sample {
             data: Bytes::from(frame.data),
             duration,
             ..Sample::new(Instant::now())
         };
-        if let Err(e) = track.sample_writer(ssrc, pt).write_sample(&sample).await {
+        let t = Instant::now();
+        let result = track.sample_writer(ssrc, pt).write_sample(&sample).await;
+        shared.stats.send.record(t.elapsed());
+        if let Err(e) = result {
             tracing::warn!("write_sample failed: {e}");
             break;
         }
+        shared.stats.frames_sent.fetch_add(1, Ordering::Relaxed);
         sent += 1;
-        if frame.keyframe {
+        if keyframe {
             tracing::debug!("sent keyframe #{sent} ({} bytes)", sample.data.len());
         }
     }

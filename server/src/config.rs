@@ -26,8 +26,11 @@ pub struct Video {
     pub fps: u32,
     /// Initial target bitrate in kbit/s (the client can change it at runtime).
     pub bitrate_kbps: u32,
-    /// Keyframe (IDR) interval in frames. `0` = only on request (new client, PLI).
+    /// Additional keyframe (IDR) interval in frames inside the encoder. `0` = none (the
+    /// time-based interval below and client requests decide).
     pub keyframe_interval: u32,
+    /// Send an IDR (with SPS/PPS) at least every this many seconds. `0` = only on request.
+    pub keyframe_interval_secs: u32,
     /// Encoder threads (`0` = auto: min(4, cores)).
     pub encoder_threads: u16,
 }
@@ -66,7 +69,8 @@ impl Default for Video {
         Self {
             fps: 30,
             bitrate_kbps: 12_000,
-            keyframe_interval: 600,
+            keyframe_interval: 0,
+            keyframe_interval_secs: 10,
             encoder_threads: 0,
         }
     }
@@ -151,7 +155,9 @@ impl Config {
 fps = {fps}
 # Initial H.264 target bitrate in kbit/s (the client --bitrate flag overrides it per session).
 bitrate_kbps = {bitrate}
-# Keyframe interval in frames; 0 = only when a client connects or asks for one (PLI).
+# Time-based keyframe (IDR + SPS/PPS) interval in seconds; 0 = only on connect / PLI.
+keyframe_interval_secs = {kf_secs}
+# Additional encoder-internal keyframe interval in frames; 0 = none.
 keyframe_interval = {kf}
 # OpenH264 threads; 0 = automatic.
 encoder_threads = {threads}
@@ -179,6 +185,7 @@ connector = "{connector}"
 "#,
             fps = v.fps,
             bitrate = v.bitrate_kbps,
+            kf_secs = v.keyframe_interval_secs,
             kf = v.keyframe_interval,
             threads = v.encoder_threads,
             public_ip = n.public_ip,
@@ -228,13 +235,16 @@ mod tests {
         assert_eq!(parsed.video.bitrate_kbps, 12_000);
         assert_eq!(parsed.network.udp_port_min, 50_000);
         assert_eq!(parsed.capture.connector, "");
-        // A file written by the previous version (no ipv6 keys, explicit connector).
+        // A file written by the previous version (no ipv6 keys, explicit connector, the old
+        // frame-based keyframe interval only).
         let old: Config = toml::from_str(
-            "[network]\npublic_ip = \"\"\n[capture]\ncard = \"\"\nconnector = \"Virtual-1\"\n",
+            "[video]\nkeyframe_interval = 600\n[network]\npublic_ip = \"\"\n[capture]\ncard = \"\"\nconnector = \"Virtual-1\"\n",
         )
         .unwrap();
         assert_eq!(old.capture.connector, "Virtual-1");
         assert!(old.network.ipv6);
+        assert_eq!(old.video.keyframe_interval, 600);
+        assert_eq!(old.video.keyframe_interval_secs, 10);
     }
 
     #[test]

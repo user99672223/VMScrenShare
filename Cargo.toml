@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["proto", "server", "client"]
+members = ["proto", "server", "client", "e2e"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,8 @@ repository = "https://github.com/user99672223/VMScrenShare"
 
 [workspace.dependencies]
 proto = { path = "proto" }
+server = { path = "server" }
+client = { path = "client" }
 
 anyhow = "1"
 thiserror = "2"
@@ -20,6 +22,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+log = "0.4"
 webrtc = "0.21"
 rtc = "0.21"
 async-trait = "0.1"
@@ -31,3 +35,9 @@ lto = "thin"
 codegen-units = 1
 debug = false
 strip = true
+
+# OpenH264 is compiled from C/C++ by the openh264-sys2 build script at the profile's opt-level.
+# Keep it optimised in debug builds too: the encoder tests and the e2e loopback test push
+# hundreds of 720p/1080p frames through it.
+[profile.dev.package.openh264-sys2]
+opt-level = 3

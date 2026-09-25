@@ -64,6 +64,12 @@ fn unpack(v: u64) -> (u32, u32) {
     ((v >> 32) as u32, v as u32)
 }
 
+impl Default for SharedView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedView {
     pub fn new() -> Self {
         Self {

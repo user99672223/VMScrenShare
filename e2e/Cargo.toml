@@ -1,0 +1,23 @@
+[package]
+name = "e2e"
+description = "vmdesk end-to-end tests: server encode/packetize -> client depacketize/decode, and a WebRTC loopback between the server and client stacks (Linux only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+proto = { workspace = true }
+server = { workspace = true }
+client = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+webrtc = { workspace = true }
+rtc = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

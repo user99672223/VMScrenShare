@@ -110,7 +110,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: client-linux
-      - name: Test (proto, key maps, YUV conversion, encoder round-trip, SDP)
+      - name: Test (unit tests + end-to-end media path and WebRTC loopback)
         run: cargo test --release --locked --workspace
       - name: Build client
         run: cargo build --release --locked -p client

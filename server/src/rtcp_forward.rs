@@ -21,11 +21,22 @@ pub const SLOT: usize = 14_000;
 pub struct KeyframeRequestForwarder {
     read_queue: VecDeque<TaggedPacket>,
     write_queue: VecDeque<TaggedPacket>,
+    /// Forward every inbound RTCP packet, not just keyframe requests (diagnostics/tests).
+    all: bool,
 }
 
 impl KeyframeRequestForwarder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A forwarder that hands *all* inbound RTCP (receiver reports, NACKs, ...) to the
+    /// application as well. Used by the end-to-end tests to observe the peer's feedback.
+    pub fn all_rtcp() -> Self {
+        Self {
+            all: true,
+            ..Self::default()
+        }
     }
 }
 
@@ -44,16 +55,20 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for KeyframeRequestForwarder {
 
     fn handle_read(&mut self, mut msg: TaggedPacket) -> Result<(), Self::Error> {
         if let Packet::Rtcp(packets) = &msg.message.packet {
-            let requests: Vec<Box<dyn rtc::rtcp::Packet>> = packets
-                .iter()
-                .filter(|p| is_keyframe_request(p.as_ref()))
-                .cloned()
-                .collect();
-            if requests.is_empty() {
-                return Ok(());
+            if self.all {
+                msg.message.add(Attribute::DeliverToApplication);
+            } else {
+                let requests: Vec<Box<dyn rtc::rtcp::Packet>> = packets
+                    .iter()
+                    .filter(|p| is_keyframe_request(p.as_ref()))
+                    .cloned()
+                    .collect();
+                if requests.is_empty() {
+                    return Ok(());
+                }
+                msg.message.packet = Packet::Rtcp(requests);
+                msg.message.add(Attribute::DeliverToApplication);
             }
-            msg.message.packet = Packet::Rtcp(requests);
-            msg.message.add(Attribute::DeliverToApplication);
         }
         self.read_queue.push_back(msg);
         Ok(())

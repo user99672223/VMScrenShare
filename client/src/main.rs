@@ -5,15 +5,11 @@
 //! * `vmdesk-net`: tokio runtime running the WebRTC session ([`net`]).
 //! * `vmdesk-decode`: FFmpeg decoding + swscale scaling ([`decoder`]).
 
-mod app;
-mod decoder;
-mod keymap;
-mod net;
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use client::{app, decoder, net};
 use winit::event_loop::EventLoop;
 
 #[derive(Parser, Debug)]
@@ -104,15 +100,5 @@ fn main() -> Result<()> {
 }
 
 fn init_logging(verbose: u8) {
-    let default = match verbose {
-        0 => "info,webrtc=warn,rtc=warn",
-        1 => "debug,webrtc=info,rtc=info",
-        _ => "trace",
-    };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    proto::logging::init(verbose, vec!["client", "proto"]);
 }

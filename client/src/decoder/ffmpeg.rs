@@ -12,11 +12,61 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 
 use anyhow::{anyhow, bail, Result};
 use ffmpeg_sys_next as ff;
 
 use super::{DecodeError, DecodedImage, HwPreference, VideoDecoder};
+
+/// `va_list` as it appears in the `av_log_set_callback` signature: on x86_64 Linux bindgen
+/// sees the array type decay to a pointer, everywhere else the alias is used as is.
+#[cfg(all(unix, target_arch = "x86_64"))]
+type VaList = *mut ff::__va_list_tag;
+#[cfg(not(all(unix, target_arch = "x86_64")))]
+type VaList = ff::va_list;
+
+/// Routes FFmpeg's log output into the `log` facade under the `ffmpeg` target, where the
+/// shared rate limiter ([`proto::logging`]) stops a damaged stream from flooding the console
+/// with one line per broken slice. Only warnings and errors are forwarded.
+unsafe extern "C" fn log_callback(avcl: *mut c_void, level: c_int, fmt: *const c_char, vl: VaList) {
+    if level > ff::AV_LOG_WARNING as c_int || fmt.is_null() {
+        return;
+    }
+    let mut line = [0 as c_char; 1024];
+    let mut print_prefix: c_int = 1;
+    let n = ff::av_log_format_line2(
+        avcl,
+        level,
+        fmt,
+        vl,
+        line.as_mut_ptr(),
+        line.len() as c_int,
+        &mut print_prefix,
+    );
+    if n <= 0 {
+        return;
+    }
+    let message = CStr::from_ptr(line.as_ptr()).to_string_lossy();
+    let message = message.trim_end();
+    if message.is_empty() {
+        return;
+    }
+    let lvl = if level <= ff::AV_LOG_ERROR as c_int {
+        log::Level::Error
+    } else {
+        log::Level::Warn
+    };
+    log::log!(target: "ffmpeg", lvl, "{message}");
+}
+
+fn install_log_callback() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        ff::av_log_set_level(ff::AV_LOG_WARNING as c_int);
+        ff::av_log_set_callback(Some(log_callback));
+    });
+}
 
 /// Passed to the `get_format` callback through `AVCodecContext::opaque`.
 struct CallbackState {
@@ -97,9 +147,7 @@ unsafe extern "C" fn get_format(
 
 impl FfmpegDecoder {
     pub fn new(preference: HwPreference) -> Result<Self> {
-        unsafe {
-            ff::av_log_set_level(ff::AV_LOG_WARNING as c_int);
-        }
+        install_log_callback();
         if preference == HwPreference::Auto {
             for (dev, name) in hw_candidates() {
                 match Self::open(Some((dev, name))) {

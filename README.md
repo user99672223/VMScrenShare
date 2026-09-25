@@ -97,6 +97,17 @@ journalctl -u vmdesk -f             # live server log
                                     # which setup granted to ./server and the installed copy)
 ```
 
+While a client is connected the log prints two `pipeline:` lines every 5 seconds:
+
+```
+pipeline: captured 30.0 fps, encoded 30.0 fps, sent 30.0 fps, 11800 kbit/s (target 12000), 1 IDR, dropped 0 (encoder busy) + 0 (sink full)
+pipeline timings avg/max ms: capture+copy 2.1/3.9, convert 1.1/2.0, encode 9.7/24.0, packetize+send 0.4/1.8
+```
+
+Every frame is encoded (a static desktop costs a few hundred bytes per frame). The three
+rates should all equal `video.fps`; if `encoded` is lower, the `encode` time is above the
+frame time (33 ms at 30 fps): lower `video.fps` or `bitrate_kbps`, or check the VM's CPU load.
+
 ## 3. Run the client
 
 ### SSH tunnel (both laptops)
@@ -176,10 +187,11 @@ To change the public address later: `sudo ./server setup --skip-apt --public-ip 
 
 ```toml
 [video]
-fps = 30                 # capture/encode rate
-bitrate_kbps = 12000     # H.264 target bitrate (client --bitrate overrides per session)
-keyframe_interval = 600  # frames between keyframes; 0 = only on request
-encoder_threads = 0      # OpenH264 threads, 0 = auto (max 4)
+fps = 30                    # capture/encode rate
+bitrate_kbps = 12000        # H.264 target bitrate (client --bitrate overrides per session)
+keyframe_interval_secs = 10 # IDR + SPS/PPS at least every N seconds; 0 = only on connect/PLI
+keyframe_interval = 0       # extra encoder-internal keyframe interval in frames; 0 = none
+encoder_threads = 0         # OpenH264 threads, 0 = auto (max 4)
 
 [network]
 public_ip = ""           # public IPv4; "" = read from the OCI metadata service
@@ -215,7 +227,8 @@ Run `./server doctor` on the VM and find the failing line here.
 | `FAIL ip6tables` | Same for IPv6: `sudo ip6tables -I INPUT 1 -p udp -m udp --dport 50000:50100 -j ACCEPT && sudo netfilter-persistent save`. |
 | `FAIL signalling port` | Something else listens on 127.0.0.1:8080. Stop it or change `network.signalling_addr` and the `ssh -L` port. |
 | `WARN systemd service` | `sudo systemctl enable --now vmdesk`; errors: `journalctl -u vmdesk -b`. |
-| `FAIL encoder` | OpenH264 could not encode a 1080p frame on this CPU. Please open an issue with the message. |
+| `WARN frame conversion` | Copying and converting a 1080p frame takes more than 12 ms (normally 2-4 ms with the NEON kernel on the Ampere cores). The VM is CPU starved: check `top` for other load. |
+| `WARN encoder` / `FAIL encoder` | OpenH264 encodes a second of moving 1080p video slower than `video.fps` (the line shows the sustained fps, ms per frame and the keyframe size). Lower `video.fps` or `bitrate_kbps`, set `encoder_threads = 4`, and check the CPU load. `FAIL` with an error message: OpenH264 could not initialise, please open an issue. |
 
 Client-side symptoms:
 
@@ -225,7 +238,9 @@ Client-side symptoms:
 | `server rejected the offer (500)` | Read `journalctl -u vmdesk` on the VM; usually the UDP port could not be bound or the display is not active yet. |
 | Title stuck at `connecting (ICE)`, then `could not connect: ICE failed` | UDP does not get through on either family: OCI security list rules missing (IPv4 and IPv6), `FAIL iptables`/`ip6tables`, or `FAIL public IPv4` (the answer then advertises the VM's private IPv4). Check `doctor`, and that your laptop's network allows outbound UDP to ports 50000-50100. The server log prints the advertised host candidates for every offer. |
 | Connected via IPv4 although both ends have IPv6 | ICE nominated the first pair that answered. Both paths work; to prefer IPv6 block the IPv4 rule temporarily or check that the OCI IPv6 ingress rule exists (`connected via IPv6 ...` then shows in the title). |
-| Connected but the window stays black | The first keyframe did not arrive; the client asks for one every few seconds. Check the server log for `encode failed` or capture errors; try `--no-hwdec` to rule out the hardware decoder. |
+| Connected but the window stays black | No decodable keyframe has arrived. The client asks for one (PLI) at most once a second until the first picture decodes, and the server sends an IDR with SPS/PPS on every request and every `keyframe_interval_secs`. Check the server log: the `pipeline:` lines must show `encoded` at the configured fps and `sent` equal to it; `encode failed` or capture errors point at the VM side. Run the client with `-v` to see `requesting a keyframe` and the decoder's reasons; `--no-hwdec` rules out the hardware decoder. |
+| Log lines `srtp ssrc=... index=N: duplicated` (client) or `srtcp ...: duplicated` (server) | A retransmitted or reordered packet arrived outside the replay window and was rejected. With the current windows (4096 packets on the client, 1024 on the server) this only happens on badly reordering paths; a burst of them is summarised by the logger (`N more warn message(s) ... suppressed`). Video recovers by itself through NACK retransmissions and, failing that, a PLI. |
+| `video: N access units, M dropped (packet loss), K late/duplicate packets` (client log) | Reassembly statistics, printed every 10 s only when something was lost. `dropped` frames were waited for 500 ms for a retransmission and then skipped; the decoder then requests a keyframe. Persistent loss: lower `--bitrate`. |
 | Title shows `h264 (software)` on the Debian laptop | VA-API is unavailable: install `intel-media-va-driver` (or `i965-va-driver`), check `vainfo`. Software decoding of 1080p30 still works on any recent laptop, just with more CPU use. |
 | Title shows `h264 (software, d3d11va rejected the stream)` | The Windows GPU driver refused the stream; update the Intel graphics driver. Software decoding continues. |
 | Smearing / blockiness after a moment | Packet loss; the client requests keyframes automatically. Lower the bitrate: `--bitrate 6000`. |
@@ -237,6 +252,15 @@ Rust stable (see `rust-toolchain.toml`).
 
 * Tests and lints (any Linux host with `libavcodec-dev libavutil-dev libswscale-dev clang`):
   `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`
+* End-to-end tests (`cargo test -p e2e`, part of the workspace run) link the server and client
+  libraries: `media_path` encodes synthetic frames with OpenH264, packetizes them to RTP,
+  reassembles and decodes them with FFmpeg's software decoder (also with the SPS/PPS packet
+  lost, checking the keyframe request); `webrtc_loopback` connects the real server and client
+  WebRTC stacks over UDP on the host's interface, streams 90 frames of 720p and asserts that
+  every access unit arrives exactly once and decodes, with and without 4% packet loss (NACK
+  recovery). The loopback tests need a non-loopback network interface and UDP ports 50777-50778.
+* aarch64 only: the NEON XRGB→I420 kernel is compared bit for bit against the scalar
+  reference by `convert::tests::platform_kernel_matches_scalar_reference` (the ARM CI job).
 * Server for the VM: CI builds it natively on GitHub's `ubuntu-24.04-arm` runner
   (`cargo build --release -p server`). From an x86_64 machine cross-compile with
   `pip install cargo-zigbuild ziglang` and
@@ -249,6 +273,7 @@ Rust stable (see `rust-toolchain.toml`).
   `LIBCLANG_PATH` to LLVM's `bin`, then `cargo build --release -p client`. Ship the DLLs from
   `FFMPEG_DIR\bin` next to `client.exe`.
 
-Repository layout: `proto/` (wire protocol, key codes, SDP helpers), `server/` (capture,
-convert, encoder, session, signalling, input, setup, doctor), `client/` (net, decoder,
-scaler, app, keymap).
+Repository layout: `proto/` (wire protocol, key codes, SDP helpers, logging), `server/`
+(capture, convert, pipeline, encoder, session, signalling, input, setup, doctor; a library plus
+the `server` binary), `client/` (net, assembler, decoder, scaler, app, keymap; a library plus
+the `client` binary), `e2e/` (end-to-end tests).

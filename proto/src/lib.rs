@@ -8,8 +8,10 @@
 //!   translates winit key codes into this enum, the server maps it onto evdev `KEY_*`.
 //! * [`signalling`]: the JSON body exchanged over `POST /offer`.
 //! * [`sdp`]: small SDP inspection/rewriting helpers used by the signalling server.
+//! * [`logging`]: tracing setup with a rate-limited bridge for the WebRTC/FFmpeg `log` output.
 
 pub mod keycode;
+pub mod logging;
 pub mod message;
 pub mod sdp;
 pub mod signalling;
