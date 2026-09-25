@@ -63,7 +63,7 @@ fn main() -> Result<()> {
             .spawn(move || decoder::run(au_rx, view, proxy, req_tx, hw))
             .context("spawning decoder thread")?;
     }
-    {
+    let net_thread = {
         let cfg = net::NetConfig {
             server_url: cli.server.clone(),
             bitrate_kbps: cli.bitrate,
@@ -91,10 +91,16 @@ fn main() -> Result<()> {
                     }
                 });
             })
-            .context("spawning network thread")?;
-    }
+            .context("spawning network thread")?
+    };
 
-    app::run(event_loop, ui_tx, view)
+    let result = app::run(event_loop, ui_tx, view);
+    // Let the network thread deliver ReleaseAll and close the connection before exiting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while !net_thread.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    result
 }
 
 fn init_logging(verbose: u8) {

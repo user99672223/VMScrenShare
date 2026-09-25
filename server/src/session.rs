@@ -256,51 +256,25 @@ impl SessionManager {
             .await
             .context("set_local_description")?;
 
-        // Non-trickle: wait until every candidate is in the local description.
+        // Non-trickle: wait until every candidate is in the local description. Other events
+        // that arrive meanwhile are kept for the session task.
         let mut events_rx = events_rx;
-        let gathered = tokio::time::timeout(GATHER_TIMEOUT, async {
-            while let Some(ev) = events_rx.recv().await {
-                match ev {
-                    PcEvent::Gathering(RTCIceGatheringState::Complete) => return Ok(Vec::new()),
-                    PcEvent::Gathering(_) => {}
-                    other => {
-                        // Keep anything else for the session task.
-                        let mut kept = vec![other];
-                        while let Ok(ev) = events_rx.try_recv() {
-                            if matches!(ev, PcEvent::Gathering(RTCIceGatheringState::Complete)) {
-                                return Ok(kept);
-                            }
-                            kept.push(ev);
-                        }
-                        // Continue waiting for gathering; deliver kept events later.
-                        return Err(kept);
-                    }
+        let mut pending: Vec<PcEvent> = Vec::new();
+        let deadline = Instant::now() + GATHER_TIMEOUT;
+        loop {
+            match tokio::time::timeout_at(deadline.into(), events_rx.recv()).await {
+                Ok(Some(PcEvent::Gathering(RTCIceGatheringState::Complete))) => break,
+                Ok(Some(PcEvent::Gathering(_))) => {}
+                Ok(Some(ev)) => pending.push(ev),
+                Ok(None) => {
+                    return Err(anyhow!("peer connection driver stopped during gathering").into())
+                }
+                Err(_) => {
+                    tracing::warn!("ICE gathering did not complete within {GATHER_TIMEOUT:?}");
+                    break;
                 }
             }
-            Ok(Vec::new())
-        })
-        .await;
-        let mut pending: Vec<PcEvent> = match gathered {
-            Ok(Ok(kept)) => kept,
-            Ok(Err(kept)) => {
-                // Gathering did not complete before another event arrived; poll once more.
-                let deadline = Instant::now() + GATHER_TIMEOUT;
-                let mut kept = kept;
-                loop {
-                    match tokio::time::timeout_at(deadline.into(), events_rx.recv()).await {
-                        Ok(Some(PcEvent::Gathering(RTCIceGatheringState::Complete))) => break,
-                        Ok(Some(PcEvent::Gathering(_))) => {}
-                        Ok(Some(ev)) => kept.push(ev),
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-                kept
-            }
-            Err(_) => {
-                tracing::warn!("ICE gathering did not complete within {GATHER_TIMEOUT:?}");
-                Vec::new()
-            }
-        };
+        }
 
         let local = pc
             .local_description()
@@ -466,9 +440,12 @@ async fn run_session(
                         shared.client_connected.store(true, Ordering::Release);
                         connected = true;
                     }
-                    RTCPeerConnectionState::Disconnected
-                    | RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Closed => break,
+                    RTCPeerConnectionState::Disconnected => {
+                        // Possibly transient (ICE consent lost); keep the session but make
+                        // sure no key stays pressed while the client is unreachable.
+                        release_input(&mgr.input);
+                    }
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => break,
                     _ => {}
                 }
             }
@@ -523,6 +500,7 @@ async fn write_frames(
         }
     };
     let mut sent = 0u64;
+    let mut last_pts: Option<u64> = None;
     while let Some(frame) = frames.recv().await {
         if payload_type.is_none() {
             match sender.get_parameters().await {
@@ -536,9 +514,18 @@ async fn write_frames(
             tracing::warn!("no negotiated payload type yet, dropping frame");
             continue;
         };
+        // Real time between frames (static content is not re-encoded every tick), bounded
+        // so a long pause does not produce a huge RTP timestamp jump.
+        let duration = match last_pts {
+            Some(prev) if frame.pts_ms > prev => {
+                Duration::from_millis(frame.pts_ms - prev).min(Duration::from_secs(2))
+            }
+            _ => frame_duration,
+        };
+        last_pts = Some(frame.pts_ms);
         let sample = Sample {
             data: Bytes::from(frame.data),
-            duration: frame_duration,
+            duration,
             ..Sample::new(Instant::now())
         };
         if let Err(e) = track.sample_writer(ssrc, pt).write_sample(&sample).await {

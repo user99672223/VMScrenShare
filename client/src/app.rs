@@ -280,7 +280,7 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
+    fn handle_key(&mut self, event: KeyEvent) {
         let PhysicalKey::Code(code) = event.physical_key else {
             return;
         };
@@ -305,7 +305,6 @@ impl App {
             self.pressed_keys.remove(&key);
         }
         self.control(ControlMessage::Key { code: key, pressed });
-        let _ = event_loop;
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -451,7 +450,7 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 if !is_synthetic {
-                    self.handle_key(event, event_loop);
+                    self.handle_key(event);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {

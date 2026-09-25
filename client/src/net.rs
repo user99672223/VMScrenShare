@@ -264,56 +264,22 @@ pub async fn run(
     }
 
     let (kf_tx, mut kf_rx) = mpsc::unbounded_channel::<()>();
-    let mut video: Option<(Arc<dyn TrackRemote>, u32)> = None;
+    let mut state = LoopState {
+        video: None,
+        connected: false,
+    };
     let mut last_pli = Instant::now() - PLI_INTERVAL;
     let mut latest_mouse: Option<MouseMove> = None;
     let mut mouse_tick = tokio::time::interval(MOUSE_FLUSH);
     mouse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut connected = false;
-
-    let handle_event = |ev: PcEvent,
-                        video: &mut Option<(Arc<dyn TrackRemote>, u32)>,
-                        connected: &mut bool|
-     -> Result<bool> {
-        match ev {
-            PcEvent::Connection(state) => {
-                tracing::info!("connection state: {state}");
-                match state {
-                    RTCPeerConnectionState::Connected => {
-                        *connected = true;
-                        status(&proxy, "connected");
-                    }
-                    RTCPeerConnectionState::Disconnected => status(&proxy, "disconnected"),
-                    RTCPeerConnectionState::Failed => {
-                        bail!(if *connected {
-                            "connection lost (ICE failed)"
-                        } else {
-                            "could not connect: ICE failed. Check the OCI security list and iptables (UDP 50000-50100) and run `server doctor` on the VM"
-                        })
-                    }
-                    RTCPeerConnectionState::Closed => bail!("connection closed by server"),
-                    _ => {}
-                }
-            }
-            PcEvent::Ice(state) => tracing::debug!("ICE connection state: {state}"),
-            PcEvent::Gathering(_) => {}
-            PcEvent::Track(track) => {
-                let ssrc = track.ssrcs().await_blocking_first();
-                tracing::info!("video track (ssrc {ssrc:?})");
-                if let Some(ssrc) = ssrc {
-                    *video = Some((Arc::clone(&track), ssrc));
-                }
-                let au_tx = au_tx.clone();
-                let kf_tx = kf_tx.clone();
-                tokio::spawn(read_track(track, au_tx, kf_tx));
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    };
 
     for ev in pending.drain(..) {
-        handle_event(ev, &mut video, &mut connected)?;
+        if on_event(ev, &mut state, &proxy, &au_tx, &kf_tx).await? {
+            if let Some((track, ssrc)) = &state.video {
+                send_pli(track, *ssrc).await;
+                last_pli = Instant::now();
+            }
+        }
     }
 
     loop {
@@ -321,9 +287,9 @@ pub async fn run(
             ev = events_rx.recv() => {
                 match ev {
                     Some(ev) => {
-                        if handle_event(ev, &mut video, &mut connected)? {
+                        if on_event(ev, &mut state, &proxy, &au_tx, &kf_tx).await? {
                             // New track: ask for a keyframe right away.
-                            if let Some((track, ssrc)) = &video {
+                            if let Some((track, ssrc)) = &state.video {
                                 send_pli(track, *ssrc).await;
                                 last_pli = Instant::now();
                             }
@@ -351,20 +317,17 @@ pub async fn run(
                 }
             }
             req = req_rx.recv() => {
-                match req {
-                    Some(DecoderRequest::Keyframe) => {
-                        if let Some((track, ssrc)) = &video {
-                            if last_pli.elapsed() >= PLI_INTERVAL {
-                                send_pli(track, *ssrc).await;
-                                last_pli = Instant::now();
-                            }
+                if let Some(DecoderRequest::Keyframe) = req {
+                    if let Some((track, ssrc)) = &state.video {
+                        if last_pli.elapsed() >= PLI_INTERVAL {
+                            send_pli(track, *ssrc).await;
+                            last_pli = Instant::now();
                         }
                     }
-                    None => {}
                 }
             }
             _ = kf_rx.recv() => {
-                if let Some((track, ssrc)) = &video {
+                if let Some((track, ssrc)) = &state.video {
                     if last_pli.elapsed() >= PLI_INTERVAL {
                         send_pli(track, *ssrc).await;
                         last_pli = Instant::now();
@@ -381,22 +344,52 @@ pub async fn run(
     Ok(())
 }
 
-/// Helper so the event handler closure can stay synchronous-looking.
-trait BlockingFirst {
-    fn await_blocking_first(self) -> Option<u32>;
+struct LoopState {
+    video: Option<(Arc<dyn TrackRemote>, u32)>,
+    connected: bool,
 }
 
-impl<F: std::future::Future<Output = Vec<u32>>> BlockingFirst for F {
-    fn await_blocking_first(self) -> Option<u32> {
-        // `Track::ssrcs` resolves immediately (it reads local state); poll it once.
-        let mut fut = Box::pin(self);
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
-        match fut.as_mut().poll(&mut cx) {
-            std::task::Poll::Ready(v) => v.first().copied(),
-            std::task::Poll::Pending => None,
+/// Handles one peer-connection event. Returns `true` when a new video track appeared.
+async fn on_event(
+    ev: PcEvent,
+    state: &mut LoopState,
+    proxy: &EventLoopProxy<UserEvent>,
+    au_tx: &SyncSender<Bytes>,
+    kf_tx: &UnboundedSender<()>,
+) -> Result<bool> {
+    match ev {
+        PcEvent::Connection(pc_state) => {
+            tracing::info!("connection state: {pc_state}");
+            match pc_state {
+                RTCPeerConnectionState::Connected => {
+                    state.connected = true;
+                    status(proxy, "connected");
+                }
+                RTCPeerConnectionState::Disconnected => status(proxy, "disconnected (waiting)"),
+                RTCPeerConnectionState::Failed => {
+                    bail!(if state.connected {
+                        "connection lost (ICE failed)"
+                    } else {
+                        "could not connect: ICE failed. Check the OCI security list and iptables (UDP 50000-50100) and run `server doctor` on the VM"
+                    })
+                }
+                RTCPeerConnectionState::Closed => bail!("connection closed by server"),
+                _ => {}
+            }
+        }
+        PcEvent::Ice(ice) => tracing::debug!("ICE connection state: {ice}"),
+        PcEvent::Gathering(_) => {}
+        PcEvent::Track(track) => {
+            let ssrc = track.ssrcs().await.first().copied();
+            tracing::info!("video track (ssrc {ssrc:?})");
+            if let Some(ssrc) = ssrc {
+                state.video = Some((Arc::clone(&track), ssrc));
+            }
+            tokio::spawn(read_track(track, au_tx.clone(), kf_tx.clone()));
+            return Ok(true);
         }
     }
+    Ok(false)
 }
 
 async fn send_pli(track: &Arc<dyn TrackRemote>, ssrc: u32) {
