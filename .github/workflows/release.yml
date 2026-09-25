@@ -1,4 +1,5 @@
 # Builds the three vmdesk artifacts and attaches them to a GitHub Release on every push to main.
+# `workflow_dispatch` on any branch builds the same artifacts without publishing a release.
 #
 #   server             aarch64-unknown-linux-gnu, cross-compiled with cargo-zigbuild (Ubuntu 24.04 glibc 2.39)
 #   client-windows.zip x86_64-pc-windows-msvc, FFmpeg shared DLLs (BtbN n8.1 LGPL build) beside client.exe
@@ -129,6 +130,8 @@ jobs:
   release:
     name: publish release
     needs: [server, client-windows, client-linux]
+    # Manual runs on other branches only build (artifacts stay on the workflow run).
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
