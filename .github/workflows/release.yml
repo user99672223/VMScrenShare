@@ -1,5 +1,5 @@
 # Builds the three vmdesk artifacts and attaches them to a GitHub Release on every push to main.
-# `workflow_dispatch` on any branch builds the same artifacts without publishing a release.
+# `workflow_dispatch` on any branch builds the same artifacts and publishes them as a pre-release.
 #
 #   server             aarch64-unknown-linux-gnu, built natively on ubuntu-24.04-arm (glibc 2.39)
 #   client-windows.zip x86_64-pc-windows-msvc, FFmpeg shared DLLs (BtbN n8.1 LGPL build) beside client.exe
@@ -128,8 +128,9 @@ jobs:
   release:
     name: publish release
     needs: [server, client-windows, client-linux]
-    # Manual runs on other branches only build (artifacts stay on the workflow run).
-    if: github.ref == 'refs/heads/main'
+    # Pushes to main publish the release marked latest; manual runs on other branches publish a
+    # pre-release so the artifacts can be downloaded without merging.
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -140,11 +141,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: vmdesk build ${{ github.run_number }}
+          name: vmdesk build ${{ github.run_number }}${{ github.ref != 'refs/heads/main' && format(' ({0})', github.ref_name) || '' }}
           target_commitish: ${{ github.sha }}
-          make_latest: true
+          make_latest: ${{ github.ref == 'refs/heads/main' }}
+          prerelease: ${{ github.ref != 'refs/heads/main' }}
           body: |
-            Automated build of `${{ github.sha }}`.
+            Automated build of `${{ github.sha }}` (branch `${{ github.ref_name }}`).
 
             | file | target |
             |---|---|

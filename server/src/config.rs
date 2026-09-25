@@ -1,7 +1,7 @@
 //! Server configuration (`/etc/vmdesk/config.toml`).
 //!
 //! Every field has a default, so a missing file or a partial file works. `setup` writes a
-//! fully commented file with the defaults.
+//! fully commented file, preserving values that are already there.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -35,10 +35,14 @@ pub struct Video {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Network {
-    /// Public IP advertised in ICE candidates. Empty = autodetect from the OCI metadata service.
+    /// Public IPv4 advertised in ICE candidates. Empty = autodetect from the OCI metadata service.
     pub public_ip: String,
     /// OCI instance metadata endpoint listing the VNICs (contains `publicIp`).
     pub metadata_url: String,
+    /// Also bind IPv6 and advertise the interface's global IPv6 address as a host candidate.
+    pub ipv6: bool,
+    /// IPv6 address to advertise instead of the interface's own global address. Empty = auto.
+    pub public_ipv6: String,
     /// First UDP port used for WebRTC media/data (one port per connection, round-robin).
     pub udp_port_min: u16,
     /// Last UDP port (inclusive).
@@ -47,12 +51,13 @@ pub struct Network {
     pub signalling_addr: SocketAddr,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Capture {
     /// DRM card node, e.g. `/dev/dri/card0`. Empty = autodetect (driver `vkms`, else by connector).
     pub card: String,
-    /// Connector whose CRTC/primary plane is captured.
+    /// Connector to capture, e.g. `Virtual-2`. Empty = the card's `Virtual-*` connector
+    /// (whichever index the kernel assigned).
     pub connector: String,
 }
 
@@ -72,18 +77,11 @@ impl Default for Network {
         Self {
             public_ip: String::new(),
             metadata_url: "http://169.254.169.254/opc/v2/vnics/".into(),
+            ipv6: true,
+            public_ipv6: String::new(),
             udp_port_min: 50_000,
             udp_port_max: 50_100,
             signalling_addr: "127.0.0.1:8080".parse().unwrap(),
-        }
-    }
-}
-
-impl Default for Capture {
-    fn default() -> Self {
-        Self {
-            card: String::new(),
-            connector: "Virtual-1".into(),
         }
     }
 }
@@ -119,15 +117,27 @@ impl Config {
             self.network.udp_port_min <= self.network.udp_port_max,
             "network.udp_port_min must be <= udp_port_max"
         );
-        anyhow::ensure!(
-            !self.capture.connector.is_empty(),
-            "capture.connector must not be empty"
-        );
+        if !self.network.public_ip.is_empty() {
+            anyhow::ensure!(
+                self.network.public_ip.parse::<std::net::Ipv4Addr>().is_ok(),
+                "network.public_ip must be an IPv4 address (got {:?})",
+                self.network.public_ip
+            );
+        }
+        if !self.network.public_ipv6.is_empty() {
+            anyhow::ensure!(
+                self.network
+                    .public_ipv6
+                    .parse::<std::net::Ipv6Addr>()
+                    .is_ok(),
+                "network.public_ipv6 must be an IPv6 address (got {:?})",
+                self.network.public_ipv6
+            );
+        }
         Ok(())
     }
 
     /// TOML text with comments, written by `setup`.
-    #[allow(dead_code)]
     pub fn to_commented_toml(&self) -> String {
         let n = &self.network;
         let v = &self.video;
@@ -147,19 +157,24 @@ keyframe_interval = {kf}
 encoder_threads = {threads}
 
 [network]
-# Public IP advertised to the client. Leave empty to read it from the OCI metadata service.
+# Public IPv4 advertised to the client. Empty = read it from the OCI metadata service
+# (`sudo ./server setup --public-ip <ip>` writes it here when the metadata has none).
 public_ip = "{public_ip}"
 metadata_url = "{metadata_url}"
-# UDP ports for WebRTC. Must be allowed in the OCI security list and in iptables.
+# Also offer the VM's global IPv6 address as a media path (needs an IPv6 security list rule).
+ipv6 = {ipv6}
+# IPv6 address to advertise instead of the interface's own global address; empty = automatic.
+public_ipv6 = "{public_ipv6}"
+# UDP ports for WebRTC. Must be allowed in the OCI security list and in iptables/ip6tables.
 udp_port_min = {pmin}
 udp_port_max = {pmax}
 # HTTP signalling listener (loopback only; use `ssh -L 8080:127.0.0.1:8080`).
 signalling_addr = "{sig}"
 
 [capture]
-# DRM card of the vkms device; empty = autodetect.
+# DRM card of the vkms device; empty = autodetect by driver name.
 card = "{card}"
-# Connector to capture.
+# Connector to capture; empty = the card's Virtual-* connector whatever its index.
 connector = "{connector}"
 "#,
             fps = v.fps,
@@ -168,6 +183,8 @@ connector = "{connector}"
             threads = v.encoder_threads,
             public_ip = n.public_ip,
             metadata_url = n.metadata_url,
+            ipv6 = n.ipv6,
+            public_ipv6 = n.public_ipv6,
             pmin = n.udp_port_min,
             pmax = n.udp_port_max,
             sig = n.signalling_addr,
@@ -188,15 +205,36 @@ mod tests {
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed, cfg);
         parsed.validate().unwrap();
+        assert!(parsed.network.ipv6);
+        assert!(parsed.capture.connector.is_empty());
     }
 
     #[test]
-    fn partial_file_uses_defaults() {
+    fn values_survive_the_commented_round_trip() {
+        let mut cfg = Config::default();
+        cfg.network.public_ip = "82.70.62.40".into();
+        cfg.network.public_ipv6 = "2001:db8::1".into();
+        cfg.network.ipv6 = false;
+        cfg.capture.connector = "Virtual-2".into();
+        let parsed: Config = toml::from_str(&cfg.to_commented_toml()).unwrap();
+        assert_eq!(parsed, cfg);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn partial_and_older_files_still_parse() {
         let parsed: Config = toml::from_str("[video]\nfps = 60\n").unwrap();
         assert_eq!(parsed.video.fps, 60);
         assert_eq!(parsed.video.bitrate_kbps, 12_000);
         assert_eq!(parsed.network.udp_port_min, 50_000);
-        assert_eq!(parsed.capture.connector, "Virtual-1");
+        assert_eq!(parsed.capture.connector, "");
+        // A file written by the previous version (no ipv6 keys, explicit connector).
+        let old: Config = toml::from_str(
+            "[network]\npublic_ip = \"\"\n[capture]\ncard = \"\"\nconnector = \"Virtual-1\"\n",
+        )
+        .unwrap();
+        assert_eq!(old.capture.connector, "Virtual-1");
+        assert!(old.network.ipv6);
     }
 
     #[test]
@@ -211,6 +249,12 @@ mod tests {
         assert!(cfg.validate().is_err());
         let mut cfg = Config::default();
         cfg.video.fps = 0;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.network.public_ip = "not-an-ip".into();
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.network.public_ipv6 = "82.70.62.40".into();
         assert!(cfg.validate().is_err());
     }
 }

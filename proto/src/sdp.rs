@@ -1,9 +1,9 @@
 //! Minimal SDP inspection and rewriting.
 //!
-//! The server is ICE-lite behind a 1:1 NAT (OCI assigns the public IP outside the VM), so the
-//! host candidates it gathers carry the VM's private address. Instead of relying on the WebRTC
-//! stack to substitute the public address, the signalling server rewrites the answer with
-//! [`rewrite_host_candidates`] before returning it. These helpers work on the SDP text only.
+//! The server is ICE-lite. Its IPv4 sits behind OCI's 1:1 NAT, so the IPv4 host candidates it
+//! gathers carry the VM's private address and have to be rewritten to the public one before the
+//! answer is returned ([`rewrite_host_candidates`]). IPv6 addresses are global (no NAT) and are
+//! kept unless an override is configured. These helpers work on the SDP text only.
 
 /// Returns true if the SDP has an `m=<kind>` media section (`"video"`, `"audio"`, `"application"`).
 pub fn has_media(sdp: &str, kind: &str) -> bool {
@@ -30,41 +30,80 @@ pub fn host_candidate_addresses(sdp: &str) -> Vec<String> {
         .collect()
 }
 
-/// Rewrites every `typ host` candidate to advertise `public_ip` instead of the interface
-/// address the socket is bound to, and points `c=` lines at it too.
+/// `"IPv6"` for an address containing a colon, `"IPv4"` otherwise.
+pub fn address_family(address: &str) -> &'static str {
+    if address.contains(':') {
+        "IPv6"
+    } else {
+        "IPv4"
+    }
+}
+
+/// `host:port`, with brackets around IPv6 addresses.
+pub fn format_endpoint(address: &str, port: u16) -> String {
+    if address.contains(':') {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
+    }
+}
+
+/// Rewrites `typ host` candidates: IPv4 ones advertise `public_ipv4` and IPv6 ones
+/// `public_ipv6`, when given. Candidates of a family without a replacement keep their address.
+/// `c=` lines are pointed at the replacement of their family as well.
 ///
 /// Candidates that become identical (same transport, address and port) after the rewrite are
 /// collapsed into one, so a VM with several interfaces bound on the same port produces a
-/// single candidate. Non-host candidates and all other lines are left untouched. Line endings
-/// (`\r\n` or `\n`) are preserved.
-pub fn rewrite_host_candidates(sdp: &str, public_ip: &str) -> String {
+/// single candidate per family. Non-host candidates and all other lines are left untouched.
+/// Line endings (`\r\n` or `\n`) are preserved.
+pub fn rewrite_host_candidates(
+    sdp: &str,
+    public_ipv4: Option<&str>,
+    public_ipv6: Option<&str>,
+) -> String {
     let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = String::with_capacity(sdp.len() + 64);
     let mut seen: Vec<String> = Vec::new();
     for line in lines(sdp) {
         if let Some(c) = parse_candidate(line) {
             if c.typ == "host" {
+                let replacement = if c.address.contains(':') {
+                    public_ipv6
+                } else {
+                    public_ipv4
+                };
+                let address = replacement.unwrap_or(c.address);
                 let key = format!(
                     "{}|{}|{}",
                     c.transport.to_ascii_lowercase(),
-                    public_ip,
+                    address,
                     c.port
                 );
                 if seen.contains(&key) {
                     continue;
                 }
                 seen.push(key);
-                out.push_str(&c.with_address(public_ip));
+                out.push_str(&c.with_address(address));
                 out.push_str(eol);
                 continue;
             }
         } else if let Some(rest) = line.strip_prefix("c=IN IP4 ") {
-            let addr = rest.trim_end();
-            if addr != "0.0.0.0" {
-                out.push_str("c=IN IP4 ");
-                out.push_str(public_ip);
-                out.push_str(eol);
-                continue;
+            if let Some(ip) = public_ipv4 {
+                if rest.trim_end() != "0.0.0.0" {
+                    out.push_str("c=IN IP4 ");
+                    out.push_str(ip);
+                    out.push_str(eol);
+                    continue;
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("c=IN IP6 ") {
+            if let Some(ip) = public_ipv6 {
+                if rest.trim_end() != "::" {
+                    out.push_str("c=IN IP6 ");
+                    out.push_str(ip);
+                    out.push_str(eol);
+                    continue;
+                }
             }
         }
         out.push_str(line);
@@ -161,6 +200,7 @@ c=IN IP4 10.0.0.7\r\n\
 a=rtcp:9 IN IP4 0.0.0.0\r\n\
 a=candidate:1234 1 udp 2130706431 10.0.0.7 50000 typ host generation 0\r\n\
 a=candidate:5678 1 UDP 2130706175 172.17.0.1 50000 typ host generation 0\r\n\
+a=candidate:abcd 1 udp 2130705919 2603:c020:4000:1::5 50000 typ host generation 0\r\n\
 a=candidate:9999 1 udp 1694498815 203.0.113.9 50000 typ srflx raddr 10.0.0.7 rport 50000\r\n\
 a=end-of-candidates\r\n\
 a=mid:0\r\n\
@@ -174,25 +214,37 @@ a=mid:1\r\n";
         assert!(has_media(ANSWER, "video"));
         assert!(has_media(ANSWER, "application"));
         assert!(!has_media(ANSWER, "audio"));
-        assert_eq!(candidate_count(ANSWER), 3);
+        assert_eq!(candidate_count(ANSWER), 4);
         assert!(is_ice_lite(ANSWER));
         assert!(!is_ice_lite("v=0\r\na=ice-options:trickle\r\n"));
         assert_eq!(
             host_candidate_addresses(ANSWER),
-            vec!["10.0.0.7".to_string(), "172.17.0.1".to_string()]
+            vec![
+                "10.0.0.7".to_string(),
+                "172.17.0.1".to_string(),
+                "2603:c020:4000:1::5".to_string()
+            ]
         );
+        assert_eq!(address_family("10.0.0.7"), "IPv4");
+        assert_eq!(address_family("2603:c020:4000:1::5"), "IPv6");
+        assert_eq!(format_endpoint("10.0.0.7", 50000), "10.0.0.7:50000");
+        assert_eq!(format_endpoint("2603::5", 50001), "[2603::5]:50001");
     }
 
     #[test]
-    fn rewrite_replaces_host_addresses_and_dedupes() {
-        let out = rewrite_host_candidates(ANSWER, "129.146.1.2");
+    fn rewrite_replaces_ipv4_hosts_and_keeps_ipv6() {
+        let out = rewrite_host_candidates(ANSWER, Some("129.146.1.2"), None);
         assert!(out.contains(
             "a=candidate:1234 1 udp 2130706431 129.146.1.2 50000 typ host generation 0\r\n"
         ));
-        // The second host candidate (other interface, same port) collapses into the first.
+        // The second IPv4 host candidate (other interface, same port) collapses into the first.
         assert!(!out.contains("172.17.0.1"));
         assert!(!out.contains("10.0.0.7 50000"));
-        assert_eq!(candidate_count(&out), 2);
+        // The IPv6 host candidate is global: kept verbatim.
+        assert!(out.contains(
+            "a=candidate:abcd 1 udp 2130705919 2603:c020:4000:1::5 50000 typ host generation 0\r\n"
+        ));
+        assert_eq!(candidate_count(&out), 3);
         // srflx candidate untouched.
         assert!(out.contains(
             "a=candidate:9999 1 udp 1694498815 203.0.113.9 50000 typ srflx raddr 10.0.0.7 rport 50000\r\n"
@@ -206,23 +258,50 @@ a=mid:1\r\n";
         assert!(out.ends_with("a=mid:1\r\n"));
         assert_eq!(
             host_candidate_addresses(&out),
-            vec!["129.146.1.2".to_string()]
+            vec!["129.146.1.2".to_string(), "2603:c020:4000:1::5".to_string()]
+        );
+    }
+
+    #[test]
+    fn rewrite_with_ipv6_override_and_without_ipv4() {
+        let out = rewrite_host_candidates(ANSWER, None, Some("2001:db8::42"));
+        // No IPv4 replacement: private IPv4 candidates stay (deduped by address, so both remain).
+        assert!(out.contains("10.0.0.7 50000 typ host"));
+        assert!(out.contains("172.17.0.1 50000 typ host"));
+        assert!(out.contains("c=IN IP4 10.0.0.7\r\n"));
+        // IPv6 replaced.
+        assert!(out.contains(
+            "a=candidate:abcd 1 udp 2130705919 2001:db8::42 50000 typ host generation 0\r\n"
+        ));
+        assert!(!out.contains("2603:c020"));
+        assert_eq!(candidate_count(&out), 4);
+        let both = rewrite_host_candidates(ANSWER, Some("129.146.1.2"), Some("2001:db8::42"));
+        assert_eq!(
+            host_candidate_addresses(&both),
+            vec!["129.146.1.2".to_string(), "2001:db8::42".to_string()]
         );
     }
 
     #[test]
     fn rewrite_keeps_lf_endings_and_untouched_input() {
         let lf = "v=0\na=candidate:1 1 udp 1 192.168.1.5 50001 typ host\n";
-        let out = rewrite_host_candidates(lf, "8.8.4.4");
+        let out = rewrite_host_candidates(lf, Some("8.8.4.4"), None);
         assert_eq!(out, "v=0\na=candidate:1 1 udp 1 8.8.4.4 50001 typ host\n");
         let plain = "v=0\r\ns=-\r\n";
-        assert_eq!(rewrite_host_candidates(plain, "1.2.3.4"), plain);
+        assert_eq!(rewrite_host_candidates(plain, Some("1.2.3.4"), None), plain);
+        // Nothing to replace: identical output.
+        assert_eq!(rewrite_host_candidates(lf, None, None), lf);
+        let v6 = "c=IN IP6 2001:db8::1\r\nc=IN IP6 ::\r\n";
+        assert_eq!(
+            rewrite_host_candidates(v6, None, Some("2001:db8::9")),
+            "c=IN IP6 2001:db8::9\r\nc=IN IP6 ::\r\n"
+        );
     }
 
     #[test]
     fn malformed_candidate_lines_pass_through() {
         let bad = "a=candidate:garbage\r\n";
-        assert_eq!(rewrite_host_candidates(bad, "1.2.3.4"), bad);
+        assert_eq!(rewrite_host_candidates(bad, Some("1.2.3.4"), None), bad);
         assert_eq!(candidate_count(bad), 1);
         assert!(host_candidate_addresses(bad).is_empty());
     }

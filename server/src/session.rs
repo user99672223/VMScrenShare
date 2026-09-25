@@ -1,12 +1,16 @@
 //! WebRTC session: one peer connection per client (a new offer replaces the previous client).
 //!
-//! * ICE-lite, host candidates only, one UDP port from the configured range per connection.
-//!   The VM sits behind a 1:1 NAT, so the answer's host candidates are rewritten to the public
-//!   IP before it is returned (see [`proto::sdp::rewrite_host_candidates`]).
+//! * ICE-lite, host candidates only, one UDP port from the configured range per connection,
+//!   bound on IPv4 and (when the VM has a global address) IPv6. The IPv4 sits behind OCI's 1:1
+//!   NAT, so IPv4 host candidates are rewritten to the public address before the answer is
+//!   returned (see [`proto::sdp::rewrite_host_candidates`]); IPv6 candidates carry the
+//!   interface's global address unless `network.public_ipv6` overrides it. The client's ICE
+//!   agent then picks whichever path works.
 //! * One H.264 video track fed by the encoder pipeline through [`Shared::sink`].
 //! * Two data channels created by the client: `control` (reliable) and `mouse` (unreliable).
 //! * PLI/FIR from the client force an IDR through [`Shared::force_keyframe`].
 
+use std::net::Ipv6Addr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,7 +33,7 @@ use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::media_stream::Track;
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
-    PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceConnectionState,
+    PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidate, RTCIceConnectionState,
     RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, Registry,
     SettingEngineBuilder,
 };
@@ -58,11 +62,32 @@ pub enum SessionError {
 
 pub type SharedInput = Arc<Mutex<Box<dyn InputSink>>>;
 
+/// Addressing facts gathered at startup.
+#[derive(Debug, Clone)]
+pub struct NetInfo {
+    /// Public IPv4 from the config or the metadata service (may be filled in later).
+    pub public_ipv4: Option<String>,
+    /// `network.public_ipv6` override, if any.
+    pub public_ipv6: Option<String>,
+    /// Global IPv6 address found on an interface (None = the VM has no IPv6).
+    pub local_ipv6: Option<Ipv6Addr>,
+    /// `network.ipv6`.
+    pub ipv6_enabled: bool,
+}
+
+impl NetInfo {
+    /// Whether to bind IPv6 sockets and advertise IPv6 candidates.
+    pub fn use_ipv6(&self) -> bool {
+        self.ipv6_enabled && (self.local_ipv6.is_some() || self.public_ipv6.is_some())
+    }
+}
+
 pub struct SessionManager {
     config: Arc<Config>,
     shared: Arc<Shared>,
     input: SharedInput,
-    public_ip: Mutex<Option<String>>,
+    net: NetInfo,
+    public_ipv4: Mutex<Option<String>>,
     next_port: Mutex<u16>,
     next_session: Mutex<u64>,
     current: tokio::sync::Mutex<Option<Arc<dyn PeerConnection>>>,
@@ -98,18 +123,15 @@ impl PeerConnectionEventHandler for Handler {
 }
 
 impl SessionManager {
-    pub fn new(
-        config: Arc<Config>,
-        shared: Arc<Shared>,
-        input: SharedInput,
-        public_ip: Option<String>,
-    ) -> Self {
+    pub fn new(config: Arc<Config>, shared: Arc<Shared>, input: SharedInput, net: NetInfo) -> Self {
         let first_port = config.network.udp_port_min;
+        let public_ipv4 = net.public_ipv4.clone();
         Self {
             config,
             shared,
             input,
-            public_ip: Mutex::new(public_ip),
+            net,
+            public_ipv4: Mutex::new(public_ipv4),
             next_port: Mutex::new(first_port),
             next_session: Mutex::new(1),
             current: tokio::sync::Mutex::new(None),
@@ -134,13 +156,13 @@ impl SessionManager {
         id
     }
 
-    /// Public IP from config, cache or (retried) metadata lookup.
-    async fn public_ip(&self) -> Option<String> {
+    /// Public IPv4 from config, cache or (retried) metadata lookup.
+    async fn public_ipv4(&self) -> Option<String> {
         if !self.config.network.public_ip.is_empty() {
             return Some(self.config.network.public_ip.clone());
         }
         if let Some(ip) = self
-            .public_ip
+            .public_ipv4
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -149,14 +171,14 @@ impl SessionManager {
         }
         match metadata::detect_public_ip(&self.config.network.metadata_url).await {
             Ok(ip) => {
-                tracing::info!("public IP {ip} (OCI metadata)");
-                *self.public_ip.lock().unwrap_or_else(|e| e.into_inner()) = Some(ip.clone());
+                tracing::info!("public IPv4 {ip} (OCI metadata)");
+                *self.public_ipv4.lock().unwrap_or_else(|e| e.into_inner()) = Some(ip.clone());
                 Some(ip)
             }
             Err(e) => {
                 tracing::warn!(
-                    "public IP unknown ({e:#}); candidates will carry the VM's private address. \
-                     Set network.public_ip in the config."
+                    "public IPv4 unknown ({e:#}); IPv4 candidates will carry the VM's private address. \
+                     Fix: sudo ./server setup --skip-apt --public-ip <ip>"
                 );
                 None
             }
@@ -190,7 +212,8 @@ impl SessionManager {
 
         let session_id = self.allocate_session_id();
         let port = self.allocate_port();
-        let public_ip = self.public_ip().await;
+        let public_ipv4 = self.public_ipv4().await;
+        let use_ipv6 = self.net.use_ipv6();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
 
         let codec = h264_codec();
@@ -204,9 +227,15 @@ impl SessionManager {
                 Slot::from(crate::rtcp_forward::SLOT),
                 KeyframeRequestForwarder::new(),
             );
+        let mut network_types = vec![NetworkType::Udp4];
+        let mut udp_addrs = vec![format!("0.0.0.0:{port}")];
+        if use_ipv6 {
+            network_types.push(NetworkType::Udp6);
+            udp_addrs.push(format!("[::]:{port}"));
+        }
         let setting_engine = SettingEngineBuilder::new()
             .with_lite(true)
-            .with_network_types(vec![NetworkType::Udp4])
+            .with_network_types(network_types)
             .with_multicast_dns_mode(MulticastDnsMode::Disabled)
             .build();
 
@@ -216,7 +245,7 @@ impl SessionManager {
             .with_setting_engine(setting_engine)
             .with_interceptor_registry(registry)
             .with_handler(Arc::new(Handler { events: events_tx }))
-            .with_udp_addrs(vec![format!("0.0.0.0:{port}")])
+            .with_udp_addrs(udp_addrs)
             .build()
             .await
             .with_context(|| format!("creating peer connection on UDP port {port}"))?;
@@ -286,16 +315,24 @@ impl SessionManager {
         if proto::sdp::candidate_count(&sdp) == 0 {
             let _ = pc.close().await;
             return Err(anyhow!(
-                "no ICE candidates gathered on UDP port {port}; is the port free and does the VM have a non-loopback IPv4 interface?"
+                "no ICE candidates gathered on UDP port {port}; is the port free and does the VM have a non-loopback interface?"
             )
             .into());
         }
-        if let Some(ip) = &public_ip {
-            sdp = proto::sdp::rewrite_host_candidates(&sdp, ip);
-        }
+        sdp = proto::sdp::rewrite_host_candidates(
+            &sdp,
+            public_ipv4.as_deref(),
+            self.net.public_ipv6.as_deref(),
+        );
+        let advertised = proto::sdp::host_candidate_addresses(&sdp);
         tracing::info!(
-            "session {session_id}: answer ready, UDP port {port}, candidates {:?}, ice-lite {}",
-            proto::sdp::host_candidate_addresses(&sdp),
+            "session {session_id}: answer ready, UDP port {port}, host candidates {} ({}), ice-lite {}",
+            advertised.join(", "),
+            advertised
+                .iter()
+                .map(|a| proto::sdp::address_family(a))
+                .collect::<Vec<_>>()
+                .join("/"),
             proto::sdp::is_ice_lite(&sdp)
         );
 
@@ -388,6 +425,24 @@ fn release_input(input: &SharedInput) {
     }
 }
 
+fn endpoint(c: &RTCIceCandidate) -> String {
+    proto::sdp::format_endpoint(&c.address, c.port)
+}
+
+/// `"IPv6: local [..]:p <-> remote [..]:p"` for the nominated candidate pair, if known yet.
+pub async fn selected_path(pc: &Arc<dyn PeerConnection>) -> Option<String> {
+    let sctp = pc.sctp().await?;
+    let ice = sctp.transport().ice_transport();
+    let pair = ice.get_selected_candidate_pair().await.ok().flatten()?;
+    let remote = pair.remote();
+    Some(format!(
+        "{}: local {} <-> remote {}",
+        proto::sdp::address_family(&remote.address),
+        endpoint(pair.local()),
+        endpoint(remote)
+    ))
+}
+
 async fn run_session(
     mgr: Arc<SessionManager>,
     session_id: u64,
@@ -441,6 +496,19 @@ async fn run_session(
                         shared.force_keyframe.store(true, Ordering::Release);
                         shared.client_connected.store(true, Ordering::Release);
                         connected = true;
+                        let pc_for_log = Arc::clone(&pc);
+                        tokio::spawn(async move {
+                            for _ in 0..5 {
+                                if let Some(path) = selected_path(&pc_for_log).await {
+                                    tracing::info!("session {session_id}: media path {path}");
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                            }
+                            tracing::info!(
+                                "session {session_id}: selected candidate pair not reported"
+                            );
+                        });
                     }
                     RTCPeerConnectionState::Disconnected => {
                         // Possibly transient (ICE consent lost); keep the session but make

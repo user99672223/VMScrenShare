@@ -18,8 +18,9 @@ native client for Windows and Debian laptops.
   extensions, no screenshots), 30 fps by default.
 * Encoding: OpenH264 (bundled source, no FFmpeg on the server), 12 Mbit/s default, High
   profile, keyframes on demand.
-* Transport: WebRTC (ICE-lite server, UDP 50000-50100, one video track, `control` + `mouse`
-  data channels). Signalling is plain HTTP on the VM's loopback, reached through an SSH tunnel.
+* Transport: WebRTC (ICE-lite server, UDP 50000-50100 over IPv4 and IPv6, one video track,
+  `control` + `mouse` data channels). ICE picks whichever path works; the title bar shows it.
+  Signalling is plain HTTP on the VM's loopback, reached through an SSH tunnel.
 * Input: uinput devices on the VM; the client sends physical key codes, the VM's keyboard
   layout applies.
 * Not in v1: audio, clipboard, remote cursor shape, TLS, multiple clients.
@@ -27,7 +28,7 @@ native client for Windows and Debian laptops.
 ## 1. Get the binaries
 
 Every push to `main` builds a GitHub Release (see `.github/workflows/release.yml`) with three
-files:
+files; a manual run of the workflow on another branch publishes the same files as a pre-release:
 
 | file                 | runs on                                                       |
 |----------------------|---------------------------------------------------------------|
@@ -45,12 +46,16 @@ From your laptop (replace `<vm-ip>` with the VM's public IP):
 scp server ubuntu@<vm-ip>:~/
 ssh ubuntu@<vm-ip>
 chmod +x server
-sudo ./server setup
+sudo ./server setup --public-ip <vm-public-ipv4>
 ```
 
+`--public-ip` is the VM's public IPv4 as shown in the OCI console. It is only needed when the
+OCI metadata service does not report a `publicIp` for the VNIC (setup prints a warning in that
+case); the value is stored in the config and kept by later runs.
+
 `setup` installs Xorg/XFCE/lightdm, configures Xorg on the vkms display (1920x1080), autologin
-for `ubuntu`, the udev rule for `/dev/uinput`, the `iptables` rule for UDP 50000-50100
-(persisted), `/etc/vmdesk/config.toml`, and the `vmdesk` systemd service that runs
+for `ubuntu`, the udev rule for `/dev/uinput`, the `iptables` and `ip6tables` rules for UDP
+50000-50100 (persisted), `/etc/vmdesk/config.toml`, and the `vmdesk` systemd service that runs
 `/usr/local/bin/vmdesk-server run`. It ends with a short checklist. Then:
 
 ```sh
@@ -67,7 +72,10 @@ Security Lists → Default Security List → Add Ingress Rules**:
 * IP Protocol: **UDP**
 * Destination Port Range: **50000-50100**
 
-(If the instance uses a Network Security Group instead, add the same rule there.) Port 8080 is
+Add a second rule for IPv6 (the VM's global IPv6 address is offered as an alternative media
+path): Source CIDR `::/0` (or your laptop's IPv6 prefix), UDP, ports 50000-50100.
+
+(If the instance uses a Network Security Group instead, add the same rules there.) Port 8080 is
 **not** opened anywhere; signalling always goes through SSH.
 
 ### Check the VM
@@ -139,8 +147,10 @@ client [--server http://127.0.0.1:8080] [--bitrate <kbit/s>] [--no-hwdec] [-v]
 * `--bitrate`: request a different bitrate for this session (server default 12000 kbit/s).
   Lower it (e.g. `--bitrate 6000`) on slow links.
 * `--no-hwdec`: force FFmpeg's software h264 decoder.
-* **F11** toggles fullscreen. The title bar shows connection state, the active decoder, the
-  video size and the decoded frame rate.
+* **F11** toggles fullscreen. The title bar shows the connection state including the selected
+  media path (`connected via IPv6 to [2603:...]:50000` or `via IPv4 to 82.70.62.40:50000`),
+  the active decoder, the video size and the decoded frame rate. The server logs the same pair
+  (`media path IPv6: local ... <-> remote ...`).
 * Keys are sent as physical positions: the layout configured in XFCE on the VM decides what
   they produce (*Settings → Keyboard → Layout*). Some combinations are taken by the local OS
   (e.g. the Windows key, Alt+Tab on some desktops) and never reach the client window.
@@ -149,11 +159,15 @@ client [--server http://127.0.0.1:8080] [--bitrate <kbit/s>] [--no-hwdec] [-v]
 ### Updating the server
 
 Copy the new `server` binary to the VM and re-run setup without the package installation; it
-re-installs the binary, re-applies the capability and restarts the service:
+re-installs the binary, re-applies the capability, rewrites the config while keeping the values
+already in it (`public_ip` included) and restarts the service:
 
 ```sh
 scp server ubuntu@<vm-ip>:~/ && ssh ubuntu@<vm-ip> 'chmod +x server && sudo ./server setup --skip-apt'
 ```
+
+To change the public address later: `sudo ./server setup --skip-apt --public-ip <ipv4>`
+(and `--public-ipv6 <ipv6>` to override the interface's IPv6 address).
 
 ## 4. Configuration
 
@@ -168,15 +182,17 @@ keyframe_interval = 600  # frames between keyframes; 0 = only on request
 encoder_threads = 0      # OpenH264 threads, 0 = auto (max 4)
 
 [network]
-public_ip = ""           # "" = read from the OCI metadata service
+public_ip = ""           # public IPv4; "" = read from the OCI metadata service
 metadata_url = "http://169.254.169.254/opc/v2/vnics/"
+ipv6 = true              # also offer the VM's global IPv6 address as a media path
+public_ipv6 = ""         # IPv6 to advertise instead of the interface's own; "" = automatic
 udp_port_min = 50000     # WebRTC UDP range (one port per connection)
 udp_port_max = 50100
 signalling_addr = "127.0.0.1:8080"
 
 [capture]
-card = ""                # DRM node of the vkms device, "" = autodetect
-connector = "Virtual-1"
+card = ""                # DRM node of the vkms device, "" = autodetect by driver name
+connector = ""           # "" = the vkms card's Virtual-* connector, whatever its index
 ```
 
 ## Troubleshooting
@@ -187,14 +203,16 @@ Run `./server doctor` on the VM and find the failing line here.
 |---|---|
 | `FAIL vkms module` | The virtual display driver is not loaded: `sudo modprobe vkms`. `setup` persists it in `/etc/modules-load.d/vmdesk.conf`; if it still fails after a reboot check `dmesg | grep vkms`. |
 | `FAIL vkms card` | No `/dev/dri/card*` belongs to driver `vkms`. Load the module (above). If the VM has another DRM device, set `capture.card` in the config to the vkms node (`/dev/dri/by-path/platform-vkms-card`). |
-| `FAIL Xorg on vkms` | Xorg is not driving `Virtual-1`. `systemctl status lightdm`, `journalctl -u lightdm -b`, `grep -E '\(EE\)|vkms' /var/log/Xorg.0.log`. Typical causes: no reboot after `setup`, lightdm not enabled, wrong `kmsdev` path in `/etc/X11/xorg.conf.d/10-vkms.conf`. |
+| `FAIL Xorg on vkms` | Xorg is not driving the vkms connector (`Virtual-N`; the index depends on which DRM devices the kernel found first, so leave `capture.connector` empty and the server picks the vkms card's Virtual connector). `systemctl status lightdm`, `journalctl -u lightdm -b`, `grep -E '\(EE\)|vkms' /var/log/Xorg.0.log`. Typical causes: no reboot after `setup`, lightdm not enabled, wrong `kmsdev` path in `/etc/X11/xorg.conf.d/10-vkms.conf`. |
 | `FAIL framebuffer capture` | The display is up but the framebuffer cannot be read. The kernel only hands out buffer handles to `CAP_SYS_ADMIN`: `sudo setcap cap_sys_admin+ep ./server` (the service gets the capability from its unit file). |
 | `FAIL CAP_SYS_ADMIN` | Same fix as above for the binary you are running by hand. |
 | `FAIL /dev/uinput` | Missing: `sudo modprobe uinput`. Not writable: the udev rule `/etc/udev/rules.d/70-vmdesk-uinput.rules` or the `input` group membership is missing; re-run `sudo ./server setup`, then log out and in. Quick fix: `sudo chgrp input /dev/uinput && sudo chmod 660 /dev/uinput`. Without it the server still streams video but ignores input (the log says `input disabled`). |
 | `WARN groups` | `sudo usermod -aG input,video ubuntu`, then log out and in (the service is unaffected: its unit sets `SupplementaryGroups`). |
 | `WARN xorg.conf.d` | `setup` was not run on this machine. |
-| `FAIL public IP` | The OCI metadata service did not answer. Put the VM's public IP in the config: `public_ip = "1.2.3.4"`, restart the service. |
+| `FAIL public IPv4` | The OCI metadata service did not report a public IP (some VNIC configurations omit `publicIp`). Run `sudo ./server setup --skip-apt --public-ip <VM public IPv4>`; it stores the address in the config and restarts the service. |
+| `WARN IPv6` | No global IPv6 address on the VM: only the IPv4 path is offered. Fine if the VNIC has no IPv6; otherwise assign one in the OCI console (or set `ipv6 = false` to silence the warning). |
 | `FAIL iptables` | No ACCEPT rule for UDP 50000-50100, or it sits below OCI's default `REJECT` rule. `sudo iptables -I INPUT 1 -p udp -m udp --dport 50000:50100 -j ACCEPT && sudo netfilter-persistent save`. |
+| `FAIL ip6tables` | Same for IPv6: `sudo ip6tables -I INPUT 1 -p udp -m udp --dport 50000:50100 -j ACCEPT && sudo netfilter-persistent save`. |
 | `FAIL signalling port` | Something else listens on 127.0.0.1:8080. Stop it or change `network.signalling_addr` and the `ssh -L` port. |
 | `WARN systemd service` | `sudo systemctl enable --now vmdesk`; errors: `journalctl -u vmdesk -b`. |
 | `FAIL encoder` | OpenH264 could not encode a 1080p frame on this CPU. Please open an issue with the message. |
@@ -205,7 +223,8 @@ Client-side symptoms:
 |---|---|
 | `POST http://127.0.0.1:8080/offer failed` | The SSH tunnel is not running, or the service is down (`systemctl status vmdesk` on the VM). |
 | `server rejected the offer (500)` | Read `journalctl -u vmdesk` on the VM; usually the UDP port could not be bound or the display is not active yet. |
-| Title stuck at `connecting (ICE)`, then `could not connect: ICE failed` | UDP does not get through: OCI security list rule missing, `FAIL iptables`, or `FAIL public IP` (the answer then advertises the VM's private address). Check `doctor`, and that your laptop's network allows outbound UDP to ports 50000-50100. |
+| Title stuck at `connecting (ICE)`, then `could not connect: ICE failed` | UDP does not get through on either family: OCI security list rules missing (IPv4 and IPv6), `FAIL iptables`/`ip6tables`, or `FAIL public IPv4` (the answer then advertises the VM's private IPv4). Check `doctor`, and that your laptop's network allows outbound UDP to ports 50000-50100. The server log prints the advertised host candidates for every offer. |
+| Connected via IPv4 although both ends have IPv6 | ICE nominated the first pair that answered. Both paths work; to prefer IPv6 block the IPv4 rule temporarily or check that the OCI IPv6 ingress rule exists (`connected via IPv6 ...` then shows in the title). |
 | Connected but the window stays black | The first keyframe did not arrive; the client asks for one every few seconds. Check the server log for `encode failed` or capture errors; try `--no-hwdec` to rule out the hardware decoder. |
 | Title shows `h264 (software)` on the Debian laptop | VA-API is unavailable: install `intel-media-va-driver` (or `i965-va-driver`), check `vainfo`. Software decoding of 1080p30 still works on any recent laptop, just with more CPU use. |
 | Title shows `h264 (software, d3d11va rejected the stream)` | The Windows GPU driver refused the stream; update the Intel graphics driver. Software decoding continues. |

@@ -1,8 +1,8 @@
 //! Kernel-level framebuffer capture from the vkms DRM device.
 //!
 //! Flow per frame:
-//! 1. Read the primary plane of the CRTC driving the `Virtual-1` connector to get the current
-//!    framebuffer id (`DRM_IOCTL_MODE_GETPLANE`).
+//! 1. Read the primary plane of the CRTC driving the vkms `Virtual-*` connector to get the
+//!    current framebuffer id (`DRM_IOCTL_MODE_GETPLANE`).
 //! 2. If the framebuffer changed since the last frame, `GETFB2` it to obtain the GEM handle,
 //!    pitch and pixel format, export the handle as a PRIME dma-buf fd and `mmap` it. Xorg with
 //!    `AccelMethod none` renders into one long-lived dumb buffer, so this happens once.
@@ -10,6 +10,9 @@
 //!
 //! `GETFB2` only returns buffer handles to the DRM master or to a process with `CAP_SYS_ADMIN`;
 //! `setup` grants that capability to the binary. If the handles come back empty we say so.
+//!
+//! The vkms card is found by driver name; its connector by type (`Virtual`), because the index
+//! in `Virtual-N` depends on which other DRM devices the kernel enumerated first.
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -61,24 +64,48 @@ impl Card {
         Ok(driver.name().to_string_lossy().into_owned())
     }
 
-    /// Names of all connectors on this card (`"Virtual-1"`, `"HDMI-A-1"`, ...).
-    pub fn connector_names(&self) -> Result<Vec<String>> {
+    /// All connectors with their names (`"Virtual-2"`, `"HDMI-A-1"`, ...).
+    fn connectors(&self) -> Result<Vec<(String, connector::Info)>> {
         let res = self
             .resource_handles()
             .context("DRM_IOCTL_MODE_GETRESOURCES")?;
-        let mut names = Vec::new();
+        let mut out = Vec::new();
         for &handle in res.connectors() {
             if let Ok(info) = self.get_connector(handle, false) {
-                names.push(connector_name(&info));
+                out.push((connector_name(&info), info));
             }
         }
-        Ok(names)
+        Ok(out)
+    }
+
+    /// Names of all connectors on this card.
+    pub fn connector_names(&self) -> Result<Vec<String>> {
+        Ok(self.connectors()?.into_iter().map(|(n, _)| n).collect())
+    }
+
+    /// Names of the connectors of type `Virtual` (vkms has exactly one).
+    pub fn virtual_connector_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .connectors()?
+            .into_iter()
+            .filter(|(_, i)| i.interface() == connector::Interface::Virtual)
+            .map(|(n, _)| n)
+            .collect())
     }
 }
 
 /// `"<interface>-<index>"`, matching the kernel/Xorg naming.
 pub fn connector_name(info: &connector::Info) -> String {
     format!("{}-{}", info.interface().as_str(), info.interface_id())
+}
+
+/// Human readable form of a connector spec (`""` = any Virtual connector).
+pub fn connector_label(spec: &str) -> String {
+    if spec.is_empty() {
+        "Virtual-* (auto)".to_string()
+    } else {
+        spec.to_string()
+    }
 }
 
 /// All `/dev/dri/card*` nodes, sorted.
@@ -100,9 +127,17 @@ pub fn card_paths() -> Vec<PathBuf> {
     cards
 }
 
+fn matches_spec(name: &str, spec: &str) -> bool {
+    if spec.is_empty() {
+        name.starts_with("Virtual-")
+    } else {
+        name == spec
+    }
+}
+
 /// Finds the vkms card: `configured` if set, else the card whose driver is `vkms`, else any card
-/// exposing a connector called `connector`.
-pub fn find_card(configured: &str, connector: &str) -> Result<Card> {
+/// exposing a connector matching `connector_spec` (`""` = any `Virtual-*`).
+pub fn find_card(configured: &str, connector_spec: &str) -> Result<Card> {
     if !configured.is_empty() {
         return Card::open(Path::new(configured));
     }
@@ -129,26 +164,31 @@ pub fn find_card(configured: &str, connector: &str) -> Result<Card> {
         if driver == "vkms" {
             return Ok(card);
         }
-        if by_connector.is_none() && connectors.iter().any(|c| c == connector) {
+        if by_connector.is_none() && connectors.iter().any(|c| matches_spec(c, connector_spec)) {
             by_connector = Some(card);
         }
     }
     if let Some(card) = by_connector {
         tracing::warn!(
-            "no card with driver vkms; using {} because it has connector {connector}",
-            card.path().display()
+            "no card with driver vkms; using {} because it has connector {}",
+            card.path().display(),
+            connector_label(connector_spec)
         );
         return Ok(card);
     }
     bail!(
-        "no DRM card with driver vkms or connector {connector} found. Cards seen:\n  {}",
+        "no DRM card with driver vkms or connector {} found. Cards seen:\n  {}",
+        connector_label(connector_spec),
         seen.join("\n  ")
     )
 }
 
 /// The connector/CRTC/plane triple that is currently scanning out.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DisplayInfo {
+    /// Connector name, e.g. `"Virtual-2"`.
+    pub name: String,
+    #[allow(dead_code)]
     pub connector: connector::Handle,
     #[allow(dead_code)]
     pub crtc: crtc::Handle,
@@ -171,33 +211,50 @@ pub enum DisplayState {
     NoPlane(String),
 }
 
-/// Locates the active display behind `connector_name`.
-pub fn locate_display(card: &Card, connector_name_wanted: &str) -> Result<DisplayInfo> {
+/// Picks the connector for `spec`: an exact name, or (empty spec) the `Virtual` connector,
+/// preferring one that is connected and driven by an encoder.
+fn select_connector(
+    connectors: Vec<(String, connector::Info)>,
+    spec: &str,
+) -> Option<(String, connector::Info)> {
+    if !spec.is_empty() {
+        return connectors.into_iter().find(|(name, _)| name == spec);
+    }
+    let mut virtuals: Vec<(String, connector::Info)> = connectors
+        .into_iter()
+        .filter(|(_, info)| info.interface() == connector::Interface::Virtual)
+        .collect();
+    if virtuals.is_empty() {
+        return None;
+    }
+    let active = |info: &connector::Info| {
+        info.state() == connector::State::Connected && info.current_encoder().is_some()
+    };
+    if let Some(pos) = virtuals.iter().position(|(_, info)| active(info)) {
+        return Some(virtuals.swap_remove(pos));
+    }
+    if let Some(pos) = virtuals
+        .iter()
+        .position(|(_, info)| info.state() == connector::State::Connected)
+    {
+        return Some(virtuals.swap_remove(pos));
+    }
+    Some(virtuals.swap_remove(0))
+}
+
+/// Locates the active display behind `connector_spec` (`""` = the card's Virtual connector).
+pub fn locate_display(card: &Card, connector_spec: &str) -> Result<DisplayInfo> {
     card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
         .context("enabling universal planes")?;
-    let res = card
-        .resource_handles()
-        .context("DRM_IOCTL_MODE_GETRESOURCES")?;
-    let mut names = Vec::new();
-    let mut found = None;
-    for &handle in res.connectors() {
-        let info = card
-            .get_connector(handle, false)
-            .with_context(|| format!("GETCONNECTOR {handle:?}"))?;
-        let name = connector_name(&info);
-        if name == connector_name_wanted {
-            found = Some(info);
-        }
-        names.push(name);
-    }
-    let conn = found.ok_or_else(|| {
+    let connectors = card.connectors()?;
+    let names: Vec<String> = connectors.iter().map(|(n, _)| n.clone()).collect();
+    let (name, conn) = select_connector(connectors, connector_spec).ok_or_else(|| {
         DisplayState::NoConnector(
-            connector_name_wanted.into(),
+            connector_label(connector_spec),
             card.path().to_path_buf(),
             names,
         )
     })?;
-    let name = connector_name_wanted.to_string();
     let encoder = conn
         .current_encoder()
         .ok_or_else(|| DisplayState::Inactive(name.clone()))?;
@@ -244,6 +301,7 @@ pub fn locate_display(card: &Card, connector_name_wanted: &str) -> Result<Displa
         .ok_or_else(|| DisplayState::NoPlane(name.clone()))?;
     let (width, height) = mode.size();
     Ok(DisplayInfo {
+        name,
         connector: conn.handle(),
         crtc,
         plane,
@@ -331,10 +389,7 @@ impl FrameSource {
             Some(fb) => fb,
             None => {
                 self.mapping = None;
-                bail!(DisplayState::NoFramebuffer(format!(
-                    "{:?}",
-                    self.display.connector
-                )));
+                bail!(DisplayState::NoFramebuffer(self.display.name.clone()));
             }
         };
         let mut remapped = false;
@@ -456,18 +511,19 @@ fn map_framebuffer(card: &Card, fb: framebuffer::Handle) -> Result<Mapping> {
 /// (used by `run`) or until `deadline` (used by `capture --png`).
 pub fn wait_for_display(
     configured_card: &str,
-    connector: &str,
+    connector_spec: &str,
     deadline: Option<Duration>,
 ) -> Result<FrameSource> {
     let start = Instant::now();
     let mut last_log = None::<Instant>;
     loop {
-        let attempt = find_card(configured_card, connector)
-            .and_then(|card| locate_display(&card, connector).map(|d| (card, d)));
+        let attempt = find_card(configured_card, connector_spec)
+            .and_then(|card| locate_display(&card, connector_spec).map(|d| (card, d)));
         match attempt {
             Ok((card, info)) => {
                 tracing::info!(
-                    "display {connector} on {} active: {}x{}@{} plane {:?}",
+                    "display {} on {} active: {}x{}@{} plane {:?}",
+                    info.name,
                     card.path().display(),
                     info.width,
                     info.height,
@@ -492,5 +548,21 @@ pub fn wait_for_display(
                 std::thread::sleep(Duration::from_millis(1000));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_matching() {
+        assert!(matches_spec("Virtual-2", ""));
+        assert!(matches_spec("Virtual-1", ""));
+        assert!(!matches_spec("HDMI-A-1", ""));
+        assert!(matches_spec("Virtual-2", "Virtual-2"));
+        assert!(!matches_spec("Virtual-2", "Virtual-1"));
+        assert_eq!(connector_label(""), "Virtual-* (auto)");
+        assert_eq!(connector_label("Virtual-2"), "Virtual-2");
     }
 }

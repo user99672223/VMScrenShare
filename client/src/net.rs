@@ -133,8 +133,9 @@ pub async fn run(
         .context("registering H264")?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)
         .context("default interceptors")?;
+    // Dual stack: gather IPv4 and IPv6 host candidates; ICE picks whichever path works.
     let setting_engine = SettingEngineBuilder::new()
-        .with_network_types(vec![NetworkType::Udp4])
+        .with_network_types(vec![NetworkType::Udp4, NetworkType::Udp6])
         .with_multicast_dns_mode(MulticastDnsMode::Disabled)
         .build();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -145,7 +146,7 @@ pub async fn run(
         .with_setting_engine(setting_engine)
         .with_interceptor_registry(registry)
         .with_handler(Arc::new(Handler { events: events_tx }))
-        .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
+        .with_udp_addrs(vec!["0.0.0.0:0".to_string(), "[::]:0".to_string()])
         .build()
         .await
         .context("creating peer connection")?;
@@ -274,7 +275,7 @@ pub async fn run(
     mouse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     for ev in pending.drain(..) {
-        if on_event(ev, &mut state, &proxy, &au_tx, &kf_tx).await? {
+        if on_event(ev, &mut state, &pc, &proxy, &au_tx, &kf_tx).await? {
             if let Some((track, ssrc)) = &state.video {
                 send_pli(track, *ssrc).await;
                 last_pli = Instant::now();
@@ -287,7 +288,7 @@ pub async fn run(
             ev = events_rx.recv() => {
                 match ev {
                     Some(ev) => {
-                        if on_event(ev, &mut state, &proxy, &au_tx, &kf_tx).await? {
+                        if on_event(ev, &mut state, &pc, &proxy, &au_tx, &kf_tx).await? {
                             // New track: ask for a keyframe right away.
                             if let Some((track, ssrc)) = &state.video {
                                 send_pli(track, *ssrc).await;
@@ -353,6 +354,7 @@ struct LoopState {
 async fn on_event(
     ev: PcEvent,
     state: &mut LoopState,
+    pc: &Arc<dyn PeerConnection>,
     proxy: &EventLoopProxy<UserEvent>,
     au_tx: &SyncSender<Bytes>,
     kf_tx: &UnboundedSender<()>,
@@ -364,6 +366,19 @@ async fn on_event(
                 RTCPeerConnectionState::Connected => {
                     state.connected = true;
                     status(proxy, "connected");
+                    // Report the nominated path once ICE exposes it (usually immediately).
+                    let pc = Arc::clone(pc);
+                    let proxy = proxy.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..5 {
+                            if let Some(path) = selected_path(&pc).await {
+                                tracing::info!("media path {path}");
+                                status(&proxy, format!("connected via {path}"));
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                    });
                 }
                 RTCPeerConnectionState::Disconnected => status(proxy, "disconnected (waiting)"),
                 RTCPeerConnectionState::Failed => {
@@ -390,6 +405,19 @@ async fn on_event(
         }
     }
     Ok(false)
+}
+
+/// `"IPv6 to [2001:db8::1]:50000"` for the nominated candidate pair, if known yet.
+async fn selected_path(pc: &Arc<dyn PeerConnection>) -> Option<String> {
+    let sctp = pc.sctp().await?;
+    let ice = sctp.transport().ice_transport();
+    let pair = ice.get_selected_candidate_pair().await.ok().flatten()?;
+    let remote = pair.remote();
+    Some(format!(
+        "{} to {}",
+        proto::sdp::address_family(&remote.address),
+        proto::sdp::format_endpoint(&remote.address, remote.port)
+    ))
 }
 
 async fn send_pli(track: &Arc<dyn TrackRemote>, ssrc: u32) {

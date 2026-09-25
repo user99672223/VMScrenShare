@@ -7,6 +7,7 @@ mod doctor;
 mod encoder;
 mod input;
 mod metadata;
+mod netinfo;
 mod pipeline;
 mod png_out;
 mod rtcp_forward;
@@ -47,6 +48,7 @@ enum Command {
     /// Run the server (default): capture, encode, serve WebRTC and inject input.
     Run,
     /// One-time system setup (root): Xorg on vkms, XFCE, lightdm autologin, udev, iptables, systemd.
+    /// Re-run with --skip-apt after updating the binary; existing config values are kept.
     Setup {
         /// Desktop user: lightdm autologin and the account the service runs as.
         #[arg(long, default_value = "ubuntu")]
@@ -57,6 +59,12 @@ enum Command {
         /// Where to install this binary for the systemd service.
         #[arg(long, default_value = setup::INSTALL_PATH)]
         install_path: PathBuf,
+        /// Public IPv4 of the VM, written to network.public_ip (use when the OCI metadata has none).
+        #[arg(long)]
+        public_ip: Option<String>,
+        /// IPv6 address to advertise instead of the interface's global address (network.public_ipv6).
+        #[arg(long)]
+        public_ipv6: Option<String>,
     },
     /// Check the machine and print PASS/FAIL per item with the fix for each failure.
     Doctor,
@@ -81,12 +89,16 @@ fn main() -> Result<()> {
             user,
             skip_apt,
             install_path,
+            public_ip,
+            public_ipv6,
         } => setup::run(
             &setup::SetupOptions {
                 user,
                 config_path: cli.config.clone(),
                 skip_apt,
                 install_path,
+                public_ip,
+                public_ipv6,
             },
             &config,
         ),
@@ -113,29 +125,45 @@ fn run(config: Config) -> Result<()> {
         .build()
         .context("creating tokio runtime")?;
     runtime.block_on(async move {
-        let public_ip = if config.network.public_ip.is_empty() {
+        let public_ipv4 = if config.network.public_ip.is_empty() {
             match metadata::detect_public_ip(&config.network.metadata_url).await {
                 Ok(ip) => {
-                    tracing::info!("public IP {ip} (OCI metadata)");
+                    tracing::info!("public IPv4 {ip} (OCI metadata)");
                     Some(ip)
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "public IP not detected yet ({e:#}); will retry on the first offer"
+                        "public IPv4 not detected ({e:#}); will retry on the first offer. \
+                         If the metadata has no publicIp: sudo ./server setup --skip-apt --public-ip <ip>"
                     );
                     None
                 }
             }
         } else {
-            tracing::info!("public IP {} (config)", config.network.public_ip);
+            tracing::info!("public IPv4 {} (config)", config.network.public_ip);
             Some(config.network.public_ip.clone())
         };
+        let local_ipv6 = netinfo::global_ipv6();
+        let public_ipv6 = (!config.network.public_ipv6.is_empty())
+            .then(|| config.network.public_ipv6.clone());
+        let net = session::NetInfo {
+            public_ipv4,
+            public_ipv6,
+            local_ipv6,
+            ipv6_enabled: config.network.ipv6,
+        };
+        match (net.ipv6_enabled, local_ipv6, &net.public_ipv6) {
+            (false, _, _) => tracing::info!("IPv6 disabled in config"),
+            (true, _, Some(ip)) => tracing::info!("IPv6 {ip} (config override) will be advertised"),
+            (true, Some(ip), None) => tracing::info!("IPv6 {ip} (interface) will be advertised"),
+            (true, None, None) => tracing::info!("no global IPv6 address found: IPv4 only"),
+        }
         let input: session::SharedInput = Arc::new(Mutex::new(input::create_sink()));
         let manager = Arc::new(session::SessionManager::new(
             Arc::clone(&config),
             shared,
             input,
-            public_ip,
+            net,
         ));
         signalling::serve(config.network.signalling_addr, manager).await
     })

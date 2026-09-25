@@ -12,7 +12,7 @@ use crate::capture;
 use crate::config::Config;
 use crate::convert::I420Frame;
 use crate::encoder::{self, EncoderSettings};
-use crate::setup;
+use crate::{netinfo, setup};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -71,8 +71,12 @@ pub fn run(config: &Config) -> Result<bool> {
     checks.push(check_uinput());
     checks.push(check_groups());
     checks.push(check_xorg_conf());
-    checks.push(check_public_ip(config));
-    checks.push(check_iptables(config));
+    checks.push(check_public_ipv4(config));
+    checks.push(check_ipv6(config));
+    checks.push(check_firewall("iptables", config));
+    if config.network.ipv6 {
+        checks.push(check_firewall("ip6tables", config));
+    }
     checks.push(check_signalling_port(config));
     checks.push(check_service());
     checks.push(check_encoder());
@@ -140,14 +144,22 @@ fn check_vkms_card(config: &Config, checks: &mut Vec<Check>) -> Option<capture::
     }
 }
 
-fn check_display_and_capture(card: capture::Card, connector: &str, checks: &mut Vec<Check>) {
-    match capture::locate_display(&card, connector) {
+fn check_display_and_capture(card: capture::Card, connector_spec: &str, checks: &mut Vec<Check>) {
+    match capture::locate_display(&card, connector_spec) {
         Ok(display) => {
             checks.push(pass(
                 "Xorg on vkms",
                 format!(
-                    "{connector} active, {}x{}@{}Hz",
-                    display.width, display.height, display.refresh
+                    "{} active, {}x{}@{}Hz{}",
+                    display.name,
+                    display.width,
+                    display.height,
+                    display.refresh,
+                    if connector_spec.is_empty() {
+                        " (connector selected by type)"
+                    } else {
+                        ""
+                    }
                 ),
             ));
             let mut source = capture::FrameSource::new(card, display);
@@ -172,12 +184,17 @@ fn check_display_and_capture(card: capture::Card, connector: &str, checks: &mut 
             }
         }
         Err(e) => {
-            checks.push(fail(
-                "Xorg on vkms",
-                format!("{e:#}"),
+            let fix = if connector_spec.is_empty() {
                 "Is the desktop up? systemctl status lightdm; journalctl -u lightdm -b; grep -E '\\(EE\\)|vkms' /var/log/Xorg.0.log\n\
-                 After `sudo ./server setup` a reboot is needed once.",
-            ));
+                 After `sudo ./server setup` a reboot is needed once."
+                    .to_string()
+            } else {
+                format!(
+                    "capture.connector = \"{connector_spec}\" is set in the config; use \"\" to pick the vkms Virtual-* connector automatically.\n\
+                     Also: systemctl status lightdm; journalctl -u lightdm -b; grep -E '\\(EE\\)|vkms' /var/log/Xorg.0.log"
+                )
+            };
+            checks.push(fail("Xorg on vkms", format!("{e:#}"), fix));
         }
     }
 }
@@ -281,10 +298,10 @@ fn check_xorg_conf() -> Check {
     }
 }
 
-fn check_public_ip(config: &Config) -> Check {
+fn check_public_ipv4(config: &Config) -> Check {
     if !config.network.public_ip.is_empty() {
         return pass(
-            "public IP",
+            "public IPv4",
             format!("{} (config)", config.network.public_ip),
         );
     }
@@ -293,40 +310,61 @@ fn check_public_ip(config: &Config) -> Check {
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => return fail("public IP", format!("runtime error: {e}"), "retry"),
+        Err(e) => return fail("public IPv4", format!("runtime error: {e}"), "retry"),
     };
     match rt.block_on(crate::metadata::detect_public_ip(&config.network.metadata_url)) {
-        Ok(ip) => pass("public IP", format!("{ip} (OCI metadata)")),
+        Ok(ip) => pass("public IPv4", format!("{ip} (OCI metadata)")),
         Err(e) => fail(
-            "public IP",
+            "public IPv4",
             format!("{e:#}"),
-            "set network.public_ip = \"<VM public IP>\" in /etc/vmdesk/config.toml and restart vmdesk",
+            "sudo ./server setup --skip-apt --public-ip <VM public IPv4>   (writes network.public_ip and restarts the service)",
         ),
     }
 }
 
-fn check_iptables(config: &Config) -> Check {
+fn check_ipv6(config: &Config) -> Check {
+    if !config.network.ipv6 {
+        return pass("IPv6", "disabled in config (IPv4 only)");
+    }
+    if !config.network.public_ipv6.is_empty() {
+        return pass(
+            "IPv6",
+            format!("{} (config override)", config.network.public_ipv6),
+        );
+    }
+    match netinfo::global_ipv6() {
+        Some(ip) => pass("IPv6", format!("{ip} (interface, advertised as a host candidate)")),
+        None => warn(
+            "IPv6",
+            "no global IPv6 address on any interface; IPv4 only",
+            "fine if the VM has no IPv6; otherwise check the VNIC's IPv6 assignment, or set network.ipv6 = false",
+        ),
+    }
+}
+
+/// Checks the INPUT chain of `tool` (`iptables` or `ip6tables`) for the UDP ACCEPT rule.
+fn check_firewall(tool: &'static str, config: &Config) -> Check {
     let ports = format!(
         "{}:{}",
         config.network.udp_port_min, config.network.udp_port_max
     );
     let fix = format!(
-        "sudo iptables -I INPUT 1 -p udp -m udp --dport {ports} -j ACCEPT && sudo netfilter-persistent save"
+        "sudo {tool} -I INPUT 1 -p udp -m udp --dport {ports} -j ACCEPT && sudo netfilter-persistent save"
     );
     let output = if unsafe { libc::geteuid() } == 0 {
-        std::process::Command::new("iptables")
+        std::process::Command::new(tool)
             .args(["-S", "INPUT"])
             .output()
     } else {
         std::process::Command::new("sudo")
-            .args(["-n", "iptables", "-S", "INPUT"])
+            .args(["-n", tool, "-S", "INPUT"])
             .output()
     };
     let output = match output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         Ok(o) => {
             return warn(
-                "iptables",
+                tool,
                 format!(
                     "cannot list rules ({})",
                     String::from_utf8_lossy(&o.stderr).trim()
@@ -334,7 +372,7 @@ fn check_iptables(config: &Config) -> Check {
                 "run `sudo ./server doctor` to check the firewall",
             )
         }
-        Err(e) => return warn("iptables", format!("iptables not runnable: {e}"), fix),
+        Err(e) => return warn(tool, format!("{tool} not runnable: {e}"), fix),
     };
     let mut accept_at = None;
     let mut reject_at = None;
@@ -351,12 +389,12 @@ fn check_iptables(config: &Config) -> Check {
     }
     match (accept_at, reject_at) {
         (Some(a), Some(r)) if a > r => fail(
-            "iptables",
+            tool,
             format!("UDP {ports} ACCEPT rule comes after a REJECT/DROP rule"),
             fix,
         ),
-        (Some(_), _) => pass("iptables", format!("UDP {ports} accepted")),
-        (None, _) => fail("iptables", format!("no ACCEPT rule for UDP {ports}"), fix),
+        (Some(_), _) => pass(tool, format!("UDP {ports} accepted")),
+        (None, _) => fail(tool, format!("no ACCEPT rule for UDP {ports}"), fix),
     }
 }
 

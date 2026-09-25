@@ -1,7 +1,9 @@
 //! `server setup`: one-shot provisioning of the VM (run as root).
 //!
 //! Idempotent: every step checks or overwrites its own file, so it can be re-run after
-//! changing the binary or the configuration.
+//! changing the binary or the configuration. The configuration file is rewritten from the
+//! values already in it (plus the command line overrides), so `setup --skip-apt` keeps a
+//! `public_ip` set earlier.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -12,6 +14,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::capture;
 use crate::config::Config;
+use crate::{metadata, netinfo};
 
 pub const INSTALL_PATH: &str = "/usr/local/bin/vmdesk-server";
 pub const XORG_CONF: &str = "/etc/X11/xorg.conf.d/10-vkms.conf";
@@ -40,6 +43,10 @@ pub struct SetupOptions {
     pub config_path: PathBuf,
     pub skip_apt: bool,
     pub install_path: PathBuf,
+    /// `--public-ip`: public IPv4 to write into the config.
+    pub public_ip: Option<String>,
+    /// `--public-ipv6`: IPv6 address to advertise instead of the interface's own.
+    pub public_ipv6: Option<String>,
 }
 
 pub fn run(opts: &SetupOptions, config: &Config) -> Result<()> {
@@ -51,11 +58,34 @@ pub fn run(opts: &SetupOptions, config: &Config) -> Result<()> {
     }
     user_exists(&opts.user)?;
 
+    // The configuration we will write: what is in the file now, plus the overrides.
+    let mut cfg = config.clone();
+    if let Some(ip) = &opts.public_ip {
+        ip.parse::<std::net::Ipv4Addr>()
+            .with_context(|| format!("--public-ip {ip:?} is not an IPv4 address"))?;
+        cfg.network.public_ip = ip.clone();
+    }
+    if let Some(ip) = &opts.public_ipv6 {
+        ip.parse::<std::net::Ipv6Addr>()
+            .with_context(|| format!("--public-ipv6 {ip:?} is not an IPv6 address"))?;
+        cfg.network.public_ipv6 = ip.clone();
+    }
+
     step("loading kernel modules vkms and uinput");
     let _ = cmd("modprobe", &["vkms"]);
     let _ = cmd("modprobe", &["uinput"]);
-    let card = detect_vkms_card(&config.capture)?;
-    println!("    vkms card: {card}");
+    let (card_path, connector) = detect_vkms(&cfg.capture)?;
+    println!("    vkms card: {card_path}, connector: {connector}");
+    if Path::new(VKMS_BY_PATH).exists() {
+        cfg.capture.card = VKMS_BY_PATH.to_string();
+    }
+    if !cfg.capture.connector.is_empty() && cfg.capture.connector != connector {
+        println!(
+            "    note: configured connector {:?} not found, switching to automatic selection",
+            cfg.capture.connector
+        );
+        cfg.capture.connector = String::new();
+    }
 
     if opts.skip_apt {
         step("skipping apt (--skip-apt)");
@@ -65,10 +95,7 @@ pub fn run(opts: &SetupOptions, config: &Config) -> Result<()> {
     }
 
     step(&format!("writing {XORG_CONF}"));
-    write_file(
-        Path::new(XORG_CONF),
-        &xorg_conf(&card, &config.capture.connector),
-    )?;
+    write_file(Path::new(XORG_CONF), &xorg_conf(&card_path, &connector))?;
 
     step(&format!("writing {LIGHTDM_CONF} (autologin {})", opts.user));
     write_file(Path::new(LIGHTDM_CONF), &lightdm_conf(&opts.user))?;
@@ -108,20 +135,51 @@ pub fn run(opts: &SetupOptions, config: &Config) -> Result<()> {
 
     step(&format!(
         "iptables: accept UDP {}-{} and persist",
-        config.network.udp_port_min, config.network.udp_port_max
+        cfg.network.udp_port_min, cfg.network.udp_port_max
     ));
-    firewall(config.network.udp_port_min, config.network.udp_port_max)?;
+    firewall(
+        "iptables",
+        cfg.network.udp_port_min,
+        cfg.network.udp_port_max,
+    )?;
+    if cfg.network.ipv6 {
+        step(&format!(
+            "ip6tables: accept UDP {}-{} and persist",
+            cfg.network.udp_port_min, cfg.network.udp_port_max
+        ));
+        match firewall(
+            "ip6tables",
+            cfg.network.udp_port_min,
+            cfg.network.udp_port_max,
+        ) {
+            Ok(()) => {}
+            Err(e) => println!("    warning: {e:#}"),
+        }
+    }
+    persist_firewall()?;
+
+    step("checking public addresses");
+    if cfg.network.public_ip.is_empty() {
+        match detect_public_ipv4_blocking(&cfg.network.metadata_url) {
+            Ok(ip) => println!("    public IPv4 {ip} (OCI metadata)"),
+            Err(e) => println!(
+                "    WARNING: public IPv4 not found ({e:#}).\n    \
+                 Re-run with the VM's public IPv4:  sudo ./server setup --skip-apt --public-ip <ip>"
+            ),
+        }
+    } else {
+        println!("    public IPv4 {} (config)", cfg.network.public_ip);
+    }
+    if cfg.network.ipv6 {
+        match (&opts.public_ipv6, netinfo::global_ipv6()) {
+            (Some(ip), _) => println!("    IPv6 {ip} (--public-ipv6 override)"),
+            (None, Some(ip)) => println!("    IPv6 {ip} (interface)"),
+            (None, None) => println!("    no global IPv6 on any interface: IPv4 only"),
+        }
+    }
 
     step(&format!("writing {}", opts.config_path.display()));
-    if opts.config_path.exists() {
-        println!("    exists, left untouched");
-    } else {
-        let mut cfg = config.clone();
-        if Path::new(VKMS_BY_PATH).exists() {
-            cfg.capture.card = VKMS_BY_PATH.to_string();
-        }
-        write_file(&opts.config_path, &cfg.to_commented_toml())?;
-    }
+    write_file(&opts.config_path, &cfg.to_commented_toml())?;
 
     step(&format!(
         "disabling screen blanking for {}'s XFCE session",
@@ -142,12 +200,18 @@ pub fn run(opts: &SetupOptions, config: &Config) -> Result<()> {
 
     println!();
     println!("Setup complete. Next:");
-    println!("  1. Reboot so lightdm/XFCE start on vkms:   sudo reboot");
+    println!("  1. Reboot so lightdm/XFCE start on vkms (first setup only):   sudo reboot");
     println!(
-        "  2. OCI console -> VCN -> security list: ingress rule for UDP {}-{} from your IP (or 0.0.0.0/0).",
-        config.network.udp_port_min, config.network.udp_port_max
+        "  2. OCI console -> VCN -> security list: ingress rules for UDP {}-{} from 0.0.0.0/0{}.",
+        cfg.network.udp_port_min,
+        cfg.network.udp_port_max,
+        if cfg.network.ipv6 {
+            " and from ::/0"
+        } else {
+            ""
+        }
     );
-    println!("  3. After the reboot check everything:      ./server doctor");
+    println!("  3. Check everything:                       ./server doctor");
     println!("  4. From your laptop:                        ssh -N -L 8080:127.0.0.1:8080 ubuntu@<vm-ip>");
     println!("     then run the client.");
     Ok(())
@@ -190,13 +254,35 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
     fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 
-fn detect_vkms_card(capture_cfg: &crate::config::Capture) -> Result<String> {
-    if Path::new(VKMS_BY_PATH).exists() {
-        return Ok(VKMS_BY_PATH.to_string());
-    }
+/// The vkms card node to put into xorg.conf and the name of its Virtual connector.
+fn detect_vkms(capture_cfg: &crate::config::Capture) -> Result<(String, String)> {
     let card = capture::find_card(&capture_cfg.card, &capture_cfg.connector)
         .context("vkms card not found; is the module loaded? (modprobe vkms)")?;
-    Ok(card.path().display().to_string())
+    let path = if Path::new(VKMS_BY_PATH).exists() {
+        VKMS_BY_PATH.to_string()
+    } else {
+        card.path().display().to_string()
+    };
+    let mut virtuals = card.virtual_connector_names().unwrap_or_default();
+    let connector = if !capture_cfg.connector.is_empty()
+        && virtuals.contains(&capture_cfg.connector)
+    {
+        capture_cfg.connector.clone()
+    } else if virtuals.is_empty() {
+        println!("    note: no Virtual connector found on {path}; using a generic monitor section");
+        "vkms".to_string()
+    } else {
+        virtuals.swap_remove(0)
+    };
+    Ok((path, connector))
+}
+
+fn detect_public_ipv4_blocking(url: &str) -> Result<String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("tokio runtime")?;
+    rt.block_on(metadata::detect_public_ip(url))
 }
 
 fn install_packages() -> Result<()> {
@@ -244,28 +330,35 @@ fn setcap(path: &Path) -> Result<()> {
     cmd("setcap", &["cap_sys_admin+ep", &p]).map(|_| ())
 }
 
-fn firewall(min: u16, max: u16) -> Result<()> {
+/// Inserts the UDP ACCEPT rule at the top of INPUT for `tool` (`iptables` or `ip6tables`).
+fn firewall(tool: &str, min: u16, max: u16) -> Result<()> {
     let ports = format!("{min}:{max}");
     let rule = ["-p", "udp", "-m", "udp", "--dport", &ports, "-j", "ACCEPT"];
     let mut check = vec!["-C", "INPUT"];
     check.extend(rule);
-    if cmd("iptables", &check).is_ok() {
-        println!("    rule already present");
+    if cmd(tool, &check).is_ok() {
+        println!("    {tool}: rule already present");
     } else {
         let mut insert = vec!["-I", "INPUT", "1"];
         insert.extend(rule);
-        cmd("iptables", &insert)?;
-        println!("    rule inserted at the top of INPUT");
+        cmd(tool, &insert)?;
+        println!("    {tool}: rule inserted at the top of INPUT");
     }
+    Ok(())
+}
+
+fn persist_firewall() -> Result<()> {
     if Path::new("/usr/sbin/netfilter-persistent").exists() {
         cmd("netfilter-persistent", &["save"])?;
-        println!("    saved with netfilter-persistent");
+        println!("    saved with netfilter-persistent (rules.v4 + rules.v6)");
     } else {
-        let rules = cmd("iptables-save", &[])?;
         fs::create_dir_all("/etc/iptables")?;
-        fs::write("/etc/iptables/rules.v4", rules)?;
+        fs::write("/etc/iptables/rules.v4", cmd("iptables-save", &[])?)?;
+        if let Ok(v6) = cmd("ip6tables-save", &[]) {
+            fs::write("/etc/iptables/rules.v6", v6)?;
+        }
         println!(
-            "    saved to /etc/iptables/rules.v4 (install iptables-persistent to restore at boot)"
+            "    saved to /etc/iptables/rules.v4 and rules.v6 (install iptables-persistent to restore at boot)"
         );
     }
     Ok(())
@@ -316,6 +409,9 @@ fn xfce_no_blank(user: &str) -> Result<()> {
     Ok(())
 }
 
+/// Xorg config: modesetting on the vkms node. The Monitor section is named after the connector
+/// so RandR matches it directly; for the single (compat) output Xorg falls back to the Screen's
+/// Monitor section anyway, so a later change of the connector index keeps working.
 pub fn xorg_conf(kmsdev: &str, connector: &str) -> String {
     format!(
         r#"# Generated by `server setup` (vmdesk). Xorg on the vkms virtual display.
@@ -442,9 +538,10 @@ mod tests {
 
     #[test]
     fn templates_contain_the_moving_parts() {
-        let x = xorg_conf("/dev/dri/card0", "Virtual-1");
-        assert!(x.contains("Option     \"kmsdev\"      \"/dev/dri/card0\""));
-        assert!(x.contains("Identifier \"Virtual-1\""));
+        let x = xorg_conf("/dev/dri/by-path/platform-vkms-card", "Virtual-2");
+        assert!(x.contains("Option     \"kmsdev\"      \"/dev/dri/by-path/platform-vkms-card\""));
+        assert!(x.contains("Identifier \"Virtual-2\""));
+        assert!(x.contains("Monitor      \"Virtual-2\""));
         assert!(x.contains("\"AccelMethod\" \"none\""));
         assert!(x.contains("PreferredMode\" \"1920x1080\""));
         let l = lightdm_conf("ubuntu");

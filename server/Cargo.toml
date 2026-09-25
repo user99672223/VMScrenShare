@@ -37,6 +37,7 @@ openh264-sys2 = "0.9"
 evdev = "0.13"
 
 # transport + signalling
+if-addrs = "0.15"
 tokio = { workspace = true, features = ["signal"] }
 webrtc = { workspace = true }
 rtc = { workspace = true }
