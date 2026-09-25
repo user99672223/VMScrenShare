@@ -12,6 +12,17 @@ path = "src/main.rs"
 [dependencies]
 proto = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+toml = "1"
+libc = "0.2"
+
+# capture
+drm = "0.15"
+drm-ffi = "0.9"
+memmap2 = "0.9"
+rayon = "1"
+png = "0.18"
