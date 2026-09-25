@@ -105,8 +105,9 @@ Tunnels: source port `8080`, destination `127.0.0.1:8080`).
 ### Windows
 
 Unzip `client-windows.zip` anywhere and start `client.exe` (double-click, or from PowerShell
-to pass flags). Hardware decoding uses D3D11VA on the Intel GPU; the window title shows
-`h264 (d3d11va)` when it is active.
+to pass flags). The executable is not code-signed, so SmartScreen shows "Windows protected your
+PC" the first time: *More info → Run anyway*. Hardware decoding uses D3D11VA on the Intel GPU;
+the window title shows `h264 (d3d11va)` when it is active.
 
 ### Debian 13
 
@@ -144,6 +145,15 @@ client [--server http://127.0.0.1:8080] [--bitrate <kbit/s>] [--no-hwdec] [-v]
   they produce (*Settings → Keyboard → Layout*). Some combinations are taken by the local OS
   (e.g. the Windows key, Alt+Tab on some desktops) and never reach the client window.
 * Closing the window or losing focus releases every key and button on the VM.
+
+### Updating the server
+
+Copy the new `server` binary to the VM and re-run setup without the package installation; it
+re-installs the binary, re-applies the capability and restarts the service:
+
+```sh
+scp server ubuntu@<vm-ip>:~/ && ssh ubuntu@<vm-ip> 'chmod +x server && sudo ./server setup --skip-apt'
+```
 
 ## 4. Configuration
 
