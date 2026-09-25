@@ -57,6 +57,7 @@ pub fn create(settings: EncoderSettings) -> Result<Box<dyn VideoEncoder>> {
 }
 
 /// Iterates over the NAL units of an Annex B byte stream (3- or 4-byte start codes).
+#[allow(dead_code)]
 pub fn nal_units(annexb: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut starts = Vec::new();
     let mut i = 0;
@@ -85,6 +86,7 @@ pub fn nal_units(annexb: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// H.264 NAL unit type of a NAL payload (first byte after the start code).
+#[allow(dead_code)]
 pub fn nal_type(nal: &[u8]) -> Option<u8> {
     nal.first().map(|b| b & 0x1F)
 }

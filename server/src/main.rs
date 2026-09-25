@@ -1,16 +1,19 @@
 //! vmdesk server binary. See the README for the full setup flow.
 
-#[allow(dead_code)]
 mod capture;
-#[allow(dead_code)]
 mod config;
-#[allow(dead_code)]
 mod convert;
-#[allow(dead_code)]
 mod encoder;
+mod input;
+mod metadata;
+mod pipeline;
 mod png_out;
+mod rtcp_forward;
+mod session;
+mod signalling;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -61,11 +64,51 @@ fn main() -> Result<()> {
     init_logging(cli.verbose);
     let config = Config::load(&cli.config)?;
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => anyhow::bail!("run: not implemented yet"),
+        Command::Run => run(config),
         Command::Setup => anyhow::bail!("setup: not implemented yet"),
         Command::Doctor => anyhow::bail!("doctor: not implemented yet"),
         Command::Capture { png, timeout_secs } => capture_png(&config, &png, timeout_secs),
     }
+}
+
+fn run(config: Config) -> Result<()> {
+    let config = Arc::new(config);
+    let shared = Arc::new(pipeline::Shared::new(config.video.bitrate_kbps));
+    pipeline::spawn(Arc::clone(&config), Arc::clone(&shared)).context("starting pipeline")?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("vmdesk-rt")
+        .enable_all()
+        .build()
+        .context("creating tokio runtime")?;
+    runtime.block_on(async move {
+        let public_ip = if config.network.public_ip.is_empty() {
+            match metadata::detect_public_ip(&config.network.metadata_url).await {
+                Ok(ip) => {
+                    tracing::info!("public IP {ip} (OCI metadata)");
+                    Some(ip)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "public IP not detected yet ({e:#}); will retry on the first offer"
+                    );
+                    None
+                }
+            }
+        } else {
+            tracing::info!("public IP {} (config)", config.network.public_ip);
+            Some(config.network.public_ip.clone())
+        };
+        let input: session::SharedInput = Arc::new(Mutex::new(Box::new(input::LogInput)));
+        let manager = Arc::new(session::SessionManager::new(
+            Arc::clone(&config),
+            shared,
+            input,
+            public_ip,
+        ));
+        signalling::serve(config.network.signalling_addr, manager).await
+    })
 }
 
 fn capture_png(config: &Config, png: &std::path::Path, timeout_secs: u64) -> Result<()> {
@@ -89,8 +132,8 @@ fn capture_png(config: &Config, png: &std::path::Path, timeout_secs: u64) -> Res
 
 fn init_logging(verbose: u8) {
     let default = match verbose {
-        0 => "info",
-        1 => "debug",
+        0 => "info,webrtc=warn,rtc=warn",
+        1 => "debug,webrtc=info,rtc=info",
         _ => "trace",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

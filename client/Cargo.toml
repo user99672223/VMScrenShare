@@ -12,6 +12,25 @@ path = "src/main.rs"
 [dependencies]
 proto = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+webrtc = { workspace = true }
+rtc = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+
+# window + presentation
+winit = "0.30"
+softbuffer = "0.4"
+
+# decoding: FFmpeg (system libavcodec/libavutil/libswscale on Linux, shared DLLs on Windows).
+# ffmpeg-sys-next is the FFI crate behind ffmpeg-next (re-exported there as `ffmpeg_next::ffi`);
+# we use it directly because the safe layer cannot express hw_device_ctx/get_format and its
+# `codec` feature drags in libavformat.
+ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec", "swscale"] }

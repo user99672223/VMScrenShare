@@ -150,6 +150,7 @@ pub fn find_card(configured: &str, connector: &str) -> Result<Card> {
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayInfo {
     pub connector: connector::Handle,
+    #[allow(dead_code)]
     pub crtc: crtc::Handle,
     pub plane: plane::Handle,
     pub width: u32,
@@ -279,6 +280,7 @@ pub struct CapturedFrame<'a> {
     pub pitch: usize,
     pub format: DrmFourcc,
     /// True if the framebuffer object changed since the previous frame (new mapping).
+    #[allow(dead_code)]
     pub remapped: bool,
 }
 
@@ -309,10 +311,12 @@ impl FrameSource {
         }
     }
 
+    #[allow(dead_code)]
     pub fn display(&self) -> &DisplayInfo {
         &self.display
     }
 
+    #[allow(dead_code)]
     pub fn card(&self) -> &Card {
         &self.card
     }

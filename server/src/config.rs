@@ -127,6 +127,7 @@ impl Config {
     }
 
     /// TOML text with comments, written by `setup`.
+    #[allow(dead_code)]
     pub fn to_commented_toml(&self) -> String {
         let n = &self.network;
         let v = &self.video;
