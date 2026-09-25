@@ -1,0 +1,156 @@
+# Builds the three vmdesk artifacts and attaches them to a GitHub Release on every push to main.
+#
+#   server             aarch64-unknown-linux-gnu, cross-compiled with cargo-zigbuild (Ubuntu 24.04 glibc 2.39)
+#   client-windows.zip x86_64-pc-windows-msvc, FFmpeg shared DLLs (BtbN n8.1 LGPL build) beside client.exe
+#   client             x86_64-unknown-linux-gnu, built inside debian:13 against its libavcodec/libavutil/libswscale
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # BtbN FFmpeg-Builds "latest" tag always carries the current point release of each branch.
+  FFMPEG_WIN_ZIP: ffmpeg-n8.1-latest-win64-lgpl-shared-8.1
+  FFMPEG_WIN_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip
+
+jobs:
+  server:
+    name: server (aarch64 linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install cargo-zigbuild and zig
+        run: python -m pip install --upgrade cargo-zigbuild==0.23.4 ziglang==0.14.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-aarch64
+      - name: Cross-compile server
+        run: cargo zigbuild --release --locked -p server --target aarch64-unknown-linux-gnu.2.39
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-gnu/release/server dist/server
+          file dist/server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server
+          path: dist/server
+          if-no-files-found: error
+
+  client-windows:
+    name: client (windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: client-windows
+      - name: Download FFmpeg shared build
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:FFMPEG_WIN_URL -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-dist
+          $dir = Join-Path (Get-Location) "ffmpeg-dist\$env:FFMPEG_WIN_ZIP"
+          Get-ChildItem "$dir\lib" | Select-Object -ExpandProperty Name
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install LLVM (libclang for bindgen)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
+            choco install llvm --no-progress -y
+          }
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build client
+        run: cargo build --release --locked -p client
+      - name: Package client-windows.zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\client-windows | Out-Null
+          Copy-Item target\release\client.exe dist\client-windows\
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" dist\client-windows\
+          Copy-Item README.md dist\client-windows\
+          Compress-Archive -Path dist\client-windows\* -DestinationPath dist\client-windows.zip
+          Get-ChildItem dist\client-windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-windows
+          path: dist/client-windows.zip
+          if-no-files-found: error
+
+  client-linux:
+    name: client (linux x86_64, debian 13)
+    runs-on: ubuntu-24.04
+    container: debian:13
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config clang libclang-dev \
+            libavcodec-dev libavutil-dev libswscale-dev
+          echo "FFmpeg: $(pkg-config --modversion libavcodec) / $(pkg-config --modversion libavutil) / $(pkg-config --modversion libswscale)"
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: client-linux
+      - name: Test (proto, key maps, YUV conversion, encoder round-trip, SDP)
+        run: cargo test --release --locked --workspace
+      - name: Build client
+        run: cargo build --release --locked -p client
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp target/release/client dist/client
+          ldd dist/client | grep -E "libav|libsw" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client
+          path: dist/client
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [server, client-windows, client-linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: List
+        run: ls -lR artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: vmdesk build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            Automated build of `${{ github.sha }}`.
+
+            | file | target |
+            |---|---|
+            | `server` | aarch64 Linux (Ubuntu 24.04 VM) |
+            | `client-windows.zip` | Windows x86_64 (client.exe + FFmpeg DLLs) |
+            | `client` | Linux x86_64 (Debian 13, needs the distro libav* packages, see README) |
+          files: |
+            artifacts/server/server
+            artifacts/client-windows/client-windows.zip
+            artifacts/client/client

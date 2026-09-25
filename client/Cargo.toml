@@ -1,0 +1,17 @@
+[package]
+name = "client"
+description = "vmdesk client: WebRTC receiver with hardware-accelerated H.264 decoding (Windows + Linux)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+proto = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

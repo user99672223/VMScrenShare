@@ -1,0 +1,17 @@
+[package]
+name = "server"
+description = "vmdesk server: vkms framebuffer capture, OpenH264 encoding, WebRTC transport and uinput injection (Linux only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+proto = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
