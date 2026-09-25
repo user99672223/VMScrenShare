@@ -177,8 +177,10 @@ impl SessionManager {
             ));
         }
 
-        // Only one client at a time: replace the previous session.
-        if let Some(old) = self.current.lock().await.take() {
+        // Only one client at a time: replace the previous session. Take the connection out of
+        // the mutex first so the guard is not held across `close().await`.
+        let previous = self.current.lock().await.take();
+        if let Some(old) = previous {
             tracing::info!("new offer received, closing the previous session");
             self.shared.client_connected.store(false, Ordering::Release);
             self.shared.clear_sink();
