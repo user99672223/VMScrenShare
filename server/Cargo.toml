@@ -33,6 +33,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 openh264 = "0.9"
 openh264-sys2 = "0.9"
 
+# input
+evdev = "0.13"
+
 # transport + signalling
 tokio = { workspace = true, features = ["signal"] }
 webrtc = { workspace = true }

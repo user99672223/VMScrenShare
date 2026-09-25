@@ -319,11 +319,15 @@ impl App {
     }
 
     fn handle_wheel(&mut self, delta: MouseScrollDelta) {
+        // winit: positive y = content moves down (wheel up), positive x = content moves right
+        // (scroll left). evdev REL_WHEEL positive = wheel up, REL_HWHEEL positive = scroll right,
+        // so only the horizontal sign flips.
         let (dx, dy) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (x, y),
-            MouseScrollDelta::PixelDelta(p) => {
-                (p.x as f32 / PIXELS_PER_NOTCH, p.y as f32 / PIXELS_PER_NOTCH)
-            }
+            MouseScrollDelta::LineDelta(x, y) => (-x, y),
+            MouseScrollDelta::PixelDelta(p) => (
+                -(p.x as f32) / PIXELS_PER_NOTCH,
+                p.y as f32 / PIXELS_PER_NOTCH,
+            ),
         };
         self.wheel_acc.0 += dx;
         self.wheel_acc.1 += dy;

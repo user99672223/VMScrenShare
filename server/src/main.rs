@@ -100,7 +100,7 @@ fn run(config: Config) -> Result<()> {
             tracing::info!("public IP {} (config)", config.network.public_ip);
             Some(config.network.public_ip.clone())
         };
-        let input: session::SharedInput = Arc::new(Mutex::new(Box::new(input::LogInput)));
+        let input: session::SharedInput = Arc::new(Mutex::new(input::create_sink()));
         let manager = Arc::new(session::SessionManager::new(
             Arc::clone(&config),
             shared,
