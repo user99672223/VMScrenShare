@@ -26,3 +26,7 @@ drm-ffi = "0.9"
 memmap2 = "0.9"
 rayon = "1"
 png = "0.18"
+
+# encoding (OpenH264 built from the bundled source, no FFmpeg on the server)
+openh264 = "0.9"
+openh264-sys2 = "0.9"

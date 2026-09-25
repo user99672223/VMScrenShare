@@ -6,6 +6,8 @@ mod capture;
 mod config;
 #[allow(dead_code)]
 mod convert;
+#[allow(dead_code)]
+mod encoder;
 mod png_out;
 
 use std::path::PathBuf;
