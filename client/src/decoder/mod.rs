@@ -55,10 +55,13 @@ pub trait VideoDecoder: Send {
     /// Short description for the title bar, e.g. `h264 (vaapi)`.
     fn name(&self) -> String;
     fn is_hardware(&self) -> bool;
+    /// Pictures produced so far.
+    fn pictures_decoded(&self) -> u64;
 }
 
-/// Consecutive failures of a hardware decoder before falling back to software.
-const HW_FAILURE_LIMIT: u32 = 4;
+/// Consecutive failures of a hardware decoder that never produced a picture before falling
+/// back to software. Once it has decoded pictures, corrupt input is treated as packet loss.
+const HW_FAILURE_LIMIT: u32 = 8;
 
 /// Decode thread main loop.
 pub fn run(
@@ -114,7 +117,7 @@ pub fn run(
             Err(DecodeError::Corrupt(msg)) => {
                 tracing::debug!("decode: {msg}");
                 request_keyframe(&mut last_request);
-                if decoder.is_hardware() {
+                if decoder.is_hardware() && decoder.pictures_decoded() == 0 {
                     hw_failures += 1;
                     if hw_failures >= HW_FAILURE_LIMIT {
                         decoder = fallback_to_software(decoder, &view);
@@ -179,5 +182,9 @@ impl VideoDecoder for BrokenDecoder {
 
     fn is_hardware(&self) -> bool {
         false
+    }
+
+    fn pictures_decoded(&self) -> u64 {
+        0
     }
 }

@@ -332,6 +332,10 @@ impl VideoDecoder for FfmpegDecoder {
     fn is_hardware(&self) -> bool {
         self.hw_name.is_some() && !self.fell_back()
     }
+
+    fn pictures_decoded(&self) -> u64 {
+        self.pictures
+    }
 }
 
 impl Drop for FfmpegDecoder {
