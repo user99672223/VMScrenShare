@@ -3,6 +3,7 @@
 mod capture;
 mod config;
 mod convert;
+mod doctor;
 mod encoder;
 mod input;
 mod metadata;
@@ -10,6 +11,7 @@ mod pipeline;
 mod png_out;
 mod rtcp_forward;
 mod session;
+mod setup;
 mod signalling;
 
 use std::path::PathBuf;
@@ -45,7 +47,17 @@ enum Command {
     /// Run the server (default): capture, encode, serve WebRTC and inject input.
     Run,
     /// One-time system setup (root): Xorg on vkms, XFCE, lightdm autologin, udev, iptables, systemd.
-    Setup,
+    Setup {
+        /// Desktop user: lightdm autologin and the account the service runs as.
+        #[arg(long, default_value = "ubuntu")]
+        user: String,
+        /// Do not run apt-get (packages already installed).
+        #[arg(long)]
+        skip_apt: bool,
+        /// Where to install this binary for the systemd service.
+        #[arg(long, default_value = setup::INSTALL_PATH)]
+        install_path: PathBuf,
+    },
     /// Check the machine and print PASS/FAIL per item with the fix for each failure.
     Doctor,
     /// Capture one frame from the vkms framebuffer and write it as PNG.
@@ -65,8 +77,26 @@ fn main() -> Result<()> {
     let config = Config::load(&cli.config)?;
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run(config),
-        Command::Setup => anyhow::bail!("setup: not implemented yet"),
-        Command::Doctor => anyhow::bail!("doctor: not implemented yet"),
+        Command::Setup {
+            user,
+            skip_apt,
+            install_path,
+        } => setup::run(
+            &setup::SetupOptions {
+                user,
+                config_path: cli.config.clone(),
+                skip_apt,
+                install_path,
+            },
+            &config,
+        ),
+        Command::Doctor => {
+            if doctor::run(&config)? {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
         Command::Capture { png, timeout_secs } => capture_png(&config, &png, timeout_secs),
     }
 }
